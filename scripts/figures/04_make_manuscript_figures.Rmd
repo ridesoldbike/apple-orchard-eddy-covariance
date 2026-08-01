@@ -961,6 +961,7 @@ save_publication_figure(
   width = 7.2,
   height = 7.1
 )
+
 ```
 
 # Figure captions and provenance

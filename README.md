@@ -488,22 +488,26 @@ and Michigan State University AgBioResearch.
 
 ## License
 
-[Specify the data and code license, for example CC BY 4.0 for data and MIT for
-code.]
+The processed data, figures, tables, and documentation are licensed under the
+Creative Commons Attribution 4.0 International License (CC BY 4.0).
+
+The R analysis scripts are licensed under the MIT License.
 
 ## Preferred citation
 
-[Dataset citation]
+Postma, K. (2026). *Processed eddy covariance carbon flux data and analysis
+scripts for Michigan apple orchards (2023–2025)* (Version 1.0.0) [Data set].
+Zenodo. https://doi.org/10.5281/zenodo.21730182
 
 ## Related publication
 
-“citation pending”]
+Related manuscript citation pending.
 
 ## Version and archival record
 
-**Repository version:** [version]  
-**Release date:** [YYYY-MM-DD]  
-**DOI or Zenodo accession:** [DOI when available]
+**Repository version:** v1.0.0  
+**Release date:** 2026-07-31  
+**DOI:** https://doi.org/10.5281/zenodo.21730182
 
 ## References cited in processing
 
