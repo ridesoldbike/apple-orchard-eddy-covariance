@@ -1,0 +1,26 @@
+{
+  "creators": [
+    {
+      "name": "Postma, Kevin",
+      "orcid": "0009-0000-7415-7148",
+      "affiliation": "Michigan State University"
+    }
+  ],
+  "title": "Processed eddy covariance carbon flux data and analysis scripts for Michigan apple orchards (2023–2025)",
+  "version": "1.0.0",
+  "description": "This repository contains processed eddy covariance carbon flux data, quality-control and manual-review records, analysis scripts, figures, and manuscript-supporting tables for a study of Michigan apple orchards from 2023 through 2025. Funding was provided by Nestlé-Gerber, the Michigan Tree Fruit Commission, and Michigan State University AgBioResearch.",
+  "access_right": "open",
+  "license": "cc-by-4.0",
+  "upload_type": "dataset",
+  "language": "eng",
+  "keywords": [
+    "eddy covariance",
+    "apple orchard",
+    "carbon flux",
+    "net ecosystem exchange",
+    "gross primary productivity",
+    "ecosystem respiration",
+    "Michigan",
+    "orchard systems"
+  ]
+}
