@@ -1,0 +1,7 @@
+manuscript_item,primary_input,calculation
+Table 1,Results_table_<year>_U50.csv plus final annual daily U50 CSVs,Annual NEE from the final half-hour processing summary; NECB = annual NEE + harvested fruit C; seasonal NEE and paired t-tests from final daily CSVs
+Table 2,Daily_LD_MD_Fluxes_plus_Drivers_plus_VPD_2024_U50.csv; Daily_LD_MD_Fluxes_plus_Drivers_plus_VPD_2025_U50.csv,"Growing-season paired-date cumulative NEE, GPP, Reco and paired t-tests from final daily U50 processing outputs"
+Table S4,LD/MD_uStar_thresholds_YEARONLY_<year>.csv,"Annual REddyProc bootstrap quantile columns 5%, 50%, and 95%, displayed as U05, U50, and U95"
+Table S5,Results_table_<year>_U50.csv,Final U50 NEE uncertainty and percentage gap-filled outputs
+Table S7,LD_energy_balance_storage_corrected_summary_<year>_10spike.csv,Regression of H + LE against Rn - G0 for daytime and midday growing-season windows
+Table S10,Fluxes_Drivers3_2024_2025.xlsx,Paired-day growing-season environmental summary and sum of the daily mean LD and MD NEE values

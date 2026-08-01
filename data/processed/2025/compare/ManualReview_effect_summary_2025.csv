@@ -1,0 +1,3 @@
+site,n_hh_total,n_auto_removed,n_final_removed,n_manual_pos_remove,n_manual_neg_remove,n_manual_pos_keep,n_manual_neg_keep,n_supplemental_pos_remove,n_supplemental_pos_keep,n_winter_pos_remove,n_winter_neg_remove,n_winter_pos_keep,n_winter_neg_keep
+LD,17519,4356,4514,36,24,7,9,0,0,40,58,24,20
+MD,17519,65,151,11,15,14,0,4,0,25,31,33,25

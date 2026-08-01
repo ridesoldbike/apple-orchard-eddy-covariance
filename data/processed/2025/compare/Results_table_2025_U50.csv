@@ -1,0 +1,5 @@
+Year,Orchard,Period,Days,NEE,Random NEE SD,u* Threshold NEE SD,Total NEE SD,% Gap-filled
+2025,LD,Full-year,365,-312,11,7,13,37
+2025,LD,Growing-season,200,-505,9,7,11,38
+2025,MD,Full-year,365,-485,10,6,12,13
+2025,MD,Growing-season,200,-590,9,6,11,4

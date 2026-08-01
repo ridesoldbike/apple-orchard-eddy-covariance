@@ -1,0 +1,3 @@
+site,n_hh_total,n_auto_removed,n_final_removed,n_manual_pos_remove,n_manual_neg_remove,n_manual_pos_keep,n_manual_neg_keep,annual_NEE_gC_m2,GS_NEE_gC_m2
+LD,17567,3478,3563,51,34,3,8,-299,-461
+MD,17567,96,175,47,32,12,8,-363,-524

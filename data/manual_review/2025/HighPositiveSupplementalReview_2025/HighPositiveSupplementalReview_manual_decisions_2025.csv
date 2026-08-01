@@ -1,0 +1,10 @@
+site,DateTime,NEE_raw,Rg,Ustar,review_period,decision,reason
+LD,5/20/25 19:30,81.9,14.1,0.345,daytime or transition,remove,Extremely high transition-period NEE; associated with unstable fluxes and declining signal strength.
+LD,7/10/25 4:30,108,0,0.0749,other nighttime,remove,"Isolated nighttime spike; low u_ (0.075), low signal strength (29), and abrupt change from neighboring values."
+LD,9/4/25 7:00,97.3,0.139,0.0323,other nighttime,remove,Isolated spike amid highly erratic NEE; very low u_ (0.032) and low signal strength (27).
+LD,9/26/25 0:00,143,0,0.0485,other nighttime,remove,"Extreme isolated nighttime spike; low u_ (0.049), low signal strength (31), and QC flag 2."
+LD,10/24/25 23:30,81.4,0,0.0209,other nighttime,remove,Isolated nighttime spike between large negative values; very low u_ (0.021) and signal strength 20.
+MD,8/28/25 8:30,139,19.1,0.199,daytime or transition,remove,Extreme transition-period spike; surrounding NEE is erratic and signal strength is poor and unstable.
+MD,10/22/25 9:00,81,NA,0.602,daytime or transition,remove,Isolated spike with missing radiation and air temperature and low signal strength (21).
+MD,10/24/25 23:30,83.9,0,0.0625,other nighttime,remove,"Isolated nighttime spike; low u_ (0.062), signal strength 20, and QC flag 2."
+MD,12/28/25 15:30,117,24.3,0.376,daytime or transition,remove,Isolated +117 spike at only about 3¡C; inconsistent with adjacent fluxes and accompanied by low signal strength (34).

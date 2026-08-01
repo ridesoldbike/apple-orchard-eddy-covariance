@@ -1,0 +1,4 @@
+Figure,Primary_source,Calculation
+Figure 2,Fluxes_Drivers3_2024_2025.xlsx,Growing-season cumulative sum of P_RAIN_tower_mm using documented phenology dates
+Figure 3 upper panel,Daily_LD_MD_Fluxes_plus_Drivers_plus_VPD_2024_U50.csv; Daily_LD_MD_Fluxes_plus_Drivers_plus_VPD_2025_U50.csv,Orchard-specific daily U50 NEE accumulated continuously across 2024-2025; harvested-fruit carbon added as export
+Figure 3 lower panel,Daily_LD_MD_Fluxes_plus_Drivers_plus_VPD_2024_U50.csv; Daily_LD_MD_Fluxes_plus_Drivers_plus_VPD_2025_U50.csv,Weekly sum of paired daily MD minus LD NEE differences

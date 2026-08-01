@@ -1,0 +1,2 @@
+# apple-orchard-eddy-covariance
+Code for processing data into 2024 and 2025 fluxes from each orchard is found in the "processing folder." Code utilizes this information to make the tables used in the manuscript is found in the "tables" folder. Code for producing the figures used in the manuscript is found in the "figures" folder.

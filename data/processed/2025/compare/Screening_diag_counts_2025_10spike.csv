@@ -1,0 +1,19 @@
+site,SeasonClass,DayNight,n_total,n_nonmissing_NEEraw,n_low_ustar,pct_low_ustar
+LD,Growing season,Day,4993,4904,272,5.447626677348287
+LD,Growing season,Night,4082,4066,1357,33.24350808427241
+LD,Growing season,NA,525,0,0,0
+LD,Shoulder season,Day,286,286,11,3.8461538461538463
+LD,Shoulder season,Night,299,298,65,21.73913043478261
+LD,Shoulder season,NA,87,0,0,0
+LD,Winter window,Day,1955,1934,43,2.1994884910485935
+LD,Winter window,Night,4005,3942,445,11.11111111111111
+LD,Winter window,NA,1287,0,0,0
+MD,Growing season,Day,4863,4810,233,4.791281102200288
+MD,Growing season,Night,3979,3975,1580,39.70846946468962
+MD,Growing season,NA,758,487,133,17.54617414248021
+MD,Shoulder season,Day,76,76,4,5.2631578947368425
+MD,Shoulder season,Night,67,67,25,37.3134328358209
+MD,Shoulder season,NA,529,0,0,0
+MD,Winter window,Day,1736,1716,43,2.4769585253456223
+MD,Winter window,Night,3577,3545,522,14.593234554095611
+MD,Winter window,NA,1934,762,18,0.9307135470527405

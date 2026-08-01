@@ -1,0 +1,4 @@
+# apple-orchard-eddy-covariance
+Processed eddy covariance carbon flux data from 2024 and 2025 along with environmental drivers from biometerological probes and the Michigan State Enviroweather station found in Grant, Michigan. The Fluxes_Drivers3_2024_2025.xlsx file contains the daily 2024 and 2025 NEE, GPP, and Reco results along with the biometerological data from the low-density orchard as well as weather data from the nearby Michigan State Enviroweather Station located nearby in Grant, MI.
+Figure support and Table support folders in the "publication" folder contain the numerical data for the figures and tables found in the manuscript.
+ 

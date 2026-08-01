@@ -1,0 +1,13 @@
+input_role,path,size_bytes,modified_time
+LD EddyPro full_output,/Users/kpostma/Documents/Research/apple-orchard-eddy-covariance/data/raw/2024/Low-density_10spike_2024/Jan_Apr_LD_2024_PF_10_per/eddypro_Jan_Apr_LD2024_10_per_full_output_2026-04-05T135750_adv.csv,4358315,2026-04-05 19:19:16
+LD EddyPro full_output,/Users/kpostma/Documents/Research/apple-orchard-eddy-covariance/data/raw/2024/Low-density_10spike_2024/GS_LD_2024_PF_10_per/eddypro_GS_LD2024_10_per_full_output_2026-04-05T192416_adv.csv,9953766,2026-04-06 07:14:08
+LD EddyPro full_output,/Users/kpostma/Documents/Research/apple-orchard-eddy-covariance/data/raw/2024/Low-density_10spike_2024/Nov_Dec_2024_PF_per10/eddypro_Nov_Dec_2024_PF_10_full_output_2026-04-06T074328_adv.csv,1958085,2026-04-06 10:32:02
+MD EddyPro full_output,/Users/kpostma/Documents/Research/apple-orchard-eddy-covariance/data/raw/2024/Moderate-density_10spike_2024/MD_Jan_Apr_2024_PF_per_10/eddypro_Jan_Apr_10per_2024_full_output_2026-04-22T182659_adv.csv,4287506,2026-04-23 01:52:28
+MD EddyPro full_output,/Users/kpostma/Documents/Research/apple-orchard-eddy-covariance/data/raw/2024/Moderate-density_10spike_2024/MD_GS_2024_PF_per_10/eddypro_GS_2024_PF_10_full_output_2026-04-07T050531_adv.csv,9102396,2026-04-07 21:32:50
+MD EddyPro full_output,/Users/kpostma/Documents/Research/apple-orchard-eddy-covariance/data/raw/2024/Moderate-density_10spike_2024/MD2024_Nov_Dec_PF_per_10/eddypro_Nov_Dec_2024_PF_10_full_output_2026-04-07T221820_adv.csv,2866785,2026-04-08 03:16:22
+LD biomet,/Users/kpostma/Documents/Research/apple-orchard-eddy-covariance/data/raw/2024/2024_biomet.csv,2253239,2026-02-21 07:36:21.407756
+Grant environmental drivers,/Users/kpostma/Documents/Research/apple-orchard-eddy-covariance/data/raw/2024/envwx_2024.csv,1475196,2026-03-02 06:29:25.445425
+HighPositive,/Users/kpostma/Documents/Research/apple-orchard-eddy-covariance/data/manual_review/2024/HighPositiveReview_2024/HighPositiveReview_manual_decisions_TEMPLATE_2024.csv,21154,2026-05-17 07:42:06.770925
+LargeNegative,/Users/kpostma/Documents/Research/apple-orchard-eddy-covariance/data/manual_review/2024/LargeNegativeReview_2024/LargeNegativeReview_manual_decisions_TEMPLATE_2024.csv,18182,2026-05-16 21:51:59.020748
+WinterNegative,/Users/kpostma/Documents/Research/apple-orchard-eddy-covariance/data/manual_review/2024/WinterNegativeReview_2024/WinterNegativeReview_manual_decisions_TEMPLATE_2024.csv,62792,2026-07-27 09:55:30.379417
+WinterPositive,/Users/kpostma/Documents/Research/apple-orchard-eddy-covariance/data/manual_review/2024/WinterPositiveReview_2024/WinterPositiveReview_manual_decisions_TEMPLATE_2024.csv,74056,2026-07-27 13:07:49.679688

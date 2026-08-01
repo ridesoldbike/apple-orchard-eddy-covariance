@@ -1,0 +1,1431 @@
+---
+title: "Manuscript Tables: Apple Orchard Eddy-Covariance Study (S10 integrated)"
+author: "Kevin Postma"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+# Knit this file from anywhere inside the RStudio project.
+# The project root is identified by the .Rproj file or another here marker.
+project_root <- here::here()
+knitr::opts_knit$set(root.dir = project_root)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE
+)
+```
+
+# Purpose
+
+This script generates manuscript Tables 1 and 2 and supplemental Tables S4, S5, S7, and S10. Tables 1, 2, S4, S5, and S7 are generated from the final 2024 and 2025 U50 processing outputs. Table S10 is generated from `data/processed/Fluxes_Drivers3_2024_2025.xlsx`, because it summarizes paired-day environmental conditions. The workflow writes analysis-ready CSV files, a combined Excel workbook, individual editable Word tables, a main-table document, a supplementary-table document, and a combined review document.
+
+```{r make_tables}
+message("SCRIPT VERSION: S10 integrated 2026-07-30 — final daily CSVs for Tables 1–2; Fluxes_Drivers3 workbook only for Table S10")
+
+# ============================================================
+# 0) PACKAGES
+# ============================================================
+
+required_packages <- c(
+  "dplyr", "tidyr", "readr", "readxl", "lubridate",
+  "stringr", "purrr", "tibble", "writexl",
+  "flextable", "officer", "here"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install the following packages before knitting this script: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(readxl)
+  library(lubridate)
+  library(stringr)
+  library(purrr)
+  library(tibble)
+  library(writexl)
+  library(flextable)
+  library(officer)
+  library(here)
+})
+
+# ============================================================
+# 1) PATHS AND STUDY METADATA
+# ============================================================
+
+processed_root <- here::here("data", "processed")
+out_table_dir  <- here::here("manuscript_tables")
+out_support_dir <- here::here(
+  "data", "processed", "publication", "table_support"
+)
+out_docs_dir <- here::here("docs")
+
+walk(
+  c(out_table_dir, out_support_dir, out_docs_dir),
+  ~ dir.create(.x, recursive = TRUE, showWarnings = FALSE)
+)
+
+# The final daily files are read directly from each annual processing folder.
+# Expected filenames:
+# Daily_LD_MD_Fluxes_plus_Drivers_plus_VPD_<year>_U50.csv
+
+years_use <- c(2024L, 2025L)
+
+# Phenology-based growing-season dates.
+gs_dates <- tribble(
+  ~year, ~gs_start,            ~gs_end,
+  2024L, as.Date("2024-03-28"), as.Date("2024-10-31"),
+  2025L, as.Date("2025-04-15"), as.Date("2025-10-31")
+)
+
+# Harvested fruit carbon exported from the orchard ecosystem.
+harvest_C <- tribble(
+  ~year, ~Orchard, ~Harvest_gC_m2,
+  2024L, "LD", 177,
+  2024L, "MD", 337,
+  2025L, "LD",  68,
+  2025L, "MD", 331
+)
+
+# ============================================================
+# 2) GENERAL HELPERS
+# ============================================================
+
+safe_sum <- function(x) {
+  if (all(is.na(x))) NA_real_ else sum(x, na.rm = TRUE)
+}
+
+safe_mean <- function(x) {
+  if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+}
+
+parse_excel_date <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  if (inherits(x, "POSIXt")) return(as.Date(x))
+
+  if (is.numeric(x)) {
+    return(as.Date(x, origin = "1899-12-30"))
+  }
+
+  x_chr <- trimws(as.character(x))
+  out <- suppressWarnings(lubridate::ymd(x_chr, quiet = TRUE))
+
+  unresolved <- is.na(out) & nzchar(x_chr)
+  if (any(unresolved)) {
+    out[unresolved] <- suppressWarnings(
+      lubridate::mdy(x_chr[unresolved], quiet = TRUE)
+    )
+  }
+
+  as.Date(out)
+}
+
+safe_ttest_p <- function(x, y) {
+  keep <- is.finite(x) & is.finite(y)
+  x <- x[keep]
+  y <- y[keep]
+
+  if (length(x) < 2 || length(y) < 2) return(NA_real_)
+  if (isTRUE(all.equal(stats::sd(x - y), 0))) return(NA_real_)
+
+  stats::t.test(y, x, paired = TRUE)$p.value
+}
+
+p_stars <- function(p) {
+  case_when(
+    is.na(p)   ~ "",
+    p <= 0.001 ~ "***",
+    p <= 0.01  ~ "**",
+    p < 0.05   ~ "*",
+    TRUE       ~ ""
+  )
+}
+
+format_p <- function(p) {
+  case_when(
+    is.na(p)   ~ "—",
+    p < 0.001  ~ "<0.001",
+    TRUE       ~ formatC(p, format = "f", digits = 3)
+  )
+}
+
+find_one_file <- function(root, pattern, label, required = TRUE) {
+  hits <- list.files(
+    root,
+    pattern = pattern,
+    full.names = TRUE,
+    recursive = TRUE,
+    ignore.case = TRUE
+  )
+
+  hits <- hits[!grepl("(^|/|\\\\)~\\$", hits)]
+
+  if (length(hits) == 0) {
+    if (required) {
+      stop("Could not find ", label, " under: ", root)
+    }
+    return(NA_character_)
+  }
+
+  if (length(hits) > 1) {
+    stop(
+      "Found more than one possible ", label, ":\n",
+      paste(hits, collapse = "\n")
+    )
+  }
+
+  hits[[1]]
+}
+
+# ============================================================
+# 3) LOAD AND VALIDATE FINAL DAILY PROCESSING OUTPUTS
+# ============================================================
+
+required_daily_columns <- c(
+  "Date",
+  "LD_NEE_gC_day", "MD_NEE_gC_day",
+  "LD_GPP_gC_day", "MD_GPP_gC_day",
+  "LD_Reco_gC_day", "MD_Reco_gC_day"
+)
+
+numeric_columns <- c(
+  "LD_NEE_gC_day", "MD_NEE_gC_day",
+  "LD_GPP_gC_day", "MD_GPP_gC_day",
+  "LD_Reco_gC_day", "MD_Reco_gC_day",
+  "LD_Rg_mean_Wm2", "Grant_Rg",
+  "Tair_mean_C", "Tair_max_C", "Grant_Tair_max",
+  "Tair_min_C", "Grant_Tair_min",
+  "LD_VPD_midday_kPa", "MD_VPD_midday_kPa",
+  "LD_VPD_day_kPa", "MD_VPD_day_kPa",
+  "LD_SWC_mean", "LD_TS_mean_C", "RH_mean_pct",
+  "P_RAIN_tower_mm", "Grant_pcpn"
+)
+
+parse_logical_flag <- function(x, label = "logical column") {
+  if (is.logical(x)) return(x)
+
+  x_chr <- tolower(trimws(as.character(x)))
+
+  out <- case_when(
+    is.na(x_chr) | x_chr == "" ~ NA,
+    x_chr %in% c("true", "t", "1", "yes", "y") ~ TRUE,
+    x_chr %in% c("false", "f", "0", "no", "n") ~ FALSE,
+    TRUE ~ NA
+  )
+
+  invalid <- !is.na(x_chr) & x_chr != "" & is.na(out)
+
+  if (any(invalid)) {
+    stop(
+      label,
+      " contains values that cannot be interpreted as TRUE or FALSE: ",
+      paste(sort(unique(x_chr[invalid])), collapse = ", ")
+    )
+  }
+
+  out
+}
+
+resolve_daily_csv <- function(year_use) {
+  year_root <- file.path(processed_root, as.character(year_use))
+
+  find_one_file(
+    year_root,
+    paste0(
+      "^Daily_LD_MD_Fluxes_plus_Drivers_plus_VPD_",
+      year_use,
+      "_U50\\.csv$"
+    ),
+    paste0("final daily U50 flux-and-driver file for ", year_use)
+  )
+}
+
+daily_paths <- set_names(
+  map_chr(years_use, resolve_daily_csv),
+  as.character(years_use)
+)
+
+walk2(
+  names(daily_paths),
+  unname(daily_paths),
+  ~ message("Final daily processing file for ", .x, ": ", .y)
+)
+
+read_final_daily_year <- function(path, year_use) {
+
+  x <- read_csv(
+    path,
+    show_col_types = FALSE,
+    na = c("", "NA", "NaN")
+  )
+
+  missing_columns <- setdiff(required_daily_columns, names(x))
+
+  if (length(missing_columns) > 0) {
+    stop(
+      "The final daily file for ", year_use,
+      " is missing required columns: ",
+      paste(missing_columns, collapse = ", "),
+      "\nFile: ", path
+    )
+  }
+
+  numeric_columns_present <- intersect(numeric_columns, names(x))
+
+  if ("GrowingSeason" %in% names(x)) {
+    x <- x %>%
+      mutate(
+        GrowingSeason_source = parse_logical_flag(
+          GrowingSeason,
+          label = paste0("GrowingSeason in the ", year_use, " daily file")
+        )
+      ) %>%
+      select(-GrowingSeason)
+  } else {
+    x$GrowingSeason_source <- NA
+  }
+
+  x <- x %>%
+    mutate(
+      Date = as.Date(as.character(Date)),
+      across(
+        all_of(numeric_columns_present),
+        ~ readr::parse_number(
+          as.character(.x),
+          na = c("", "NA", "NaN")
+        )
+      )
+    ) %>%
+    filter(!is.na(Date))
+
+  outside_year <- x %>%
+    filter(lubridate::year(Date) != year_use)
+
+  if (nrow(outside_year) > 0) {
+    message(
+      "Removing ", nrow(outside_year),
+      " boundary-date row(s) from the ", year_use,
+      " daily file: ",
+      paste(sort(unique(as.character(outside_year$Date))), collapse = ", ")
+    )
+  }
+
+  x %>%
+    filter(lubridate::year(Date) == year_use) %>%
+    mutate(
+      year = as.integer(year_use),
+      scen = "U50",
+      source_file = basename(path)
+    )
+}
+
+daily <- map2_dfr(
+  unname(daily_paths),
+  years_use,
+  read_final_daily_year
+) %>%
+  arrange(Date)
+
+if (anyDuplicated(daily$Date) > 0) {
+  duplicate_dates <- daily %>% count(Date) %>% filter(n > 1)
+  print(duplicate_dates, n = Inf)
+  stop("Duplicate dates were found in the final daily processing files.")
+}
+
+if (any(lubridate::year(daily$Date) != daily$year, na.rm = TRUE)) {
+  stop("At least one date does not match its annual processing-file year.")
+}
+
+# Independently calculate the growing-season classification.
+daily <- daily %>%
+  left_join(gs_dates, by = "year") %>%
+  mutate(
+    GrowingSeason_calc = Date >= gs_start & Date <= gs_end
+  )
+
+gs_mismatch <- daily %>%
+  filter(
+    !is.na(GrowingSeason_source),
+    GrowingSeason_source != GrowingSeason_calc
+  ) %>%
+  select(
+    year,
+    Date,
+    source_file,
+    GrowingSeason_source,
+    GrowingSeason_calc
+  )
+
+if (nrow(gs_mismatch) > 0) {
+  print(gs_mismatch, n = Inf)
+  stop(
+    "GrowingSeason values in a final daily processing file do not match ",
+    "the documented phenology dates."
+  )
+}
+
+daily <- daily %>%
+  mutate(
+    GrowingSeason = GrowingSeason_calc,
+    Period = case_when(
+      Date < gs_start ~ "NGS-1",
+      GrowingSeason   ~ "Growing season",
+      Date > gs_end   ~ "NGS-2",
+      TRUE            ~ NA_character_
+    ),
+    Period = factor(
+      Period,
+      levels = c("NGS-1", "Growing season", "NGS-2")
+    )
+  ) %>%
+  select(-GrowingSeason_calc, -GrowingSeason_source)
+
+# Date coverage check: rows should span both complete calendar years.
+expected_dates <- bind_rows(
+  tibble(Date = seq(as.Date("2024-01-01"), as.Date("2024-12-31"), by = "day")),
+  tibble(Date = seq(as.Date("2025-01-01"), as.Date("2025-12-31"), by = "day"))
+)
+
+missing_calendar_dates <- anti_join(
+  expected_dates,
+  daily %>% select(Date),
+  by = "Date"
+)
+
+if (nrow(missing_calendar_dates) > 0) {
+  warning(
+    "The final daily processing files are missing ",
+    nrow(missing_calendar_dates),
+    " calendar dates. Flux totals will use available daily estimates."
+  )
+}
+
+coverage_check <- daily %>%
+  group_by(year, source_file) %>%
+  summarise(
+    calendar_rows = n(),
+    LD_NEE_days = sum(!is.na(LD_NEE_gC_day)),
+    MD_NEE_days = sum(!is.na(MD_NEE_gC_day)),
+    paired_NEE_days = sum(
+      !is.na(LD_NEE_gC_day) & !is.na(MD_NEE_gC_day)
+    ),
+    .groups = "drop"
+  )
+
+print(coverage_check, n = Inf)
+
+write_csv(
+  coverage_check,
+  file.path(out_support_dir, "Final_daily_files_coverage_check.csv")
+)
+
+write_csv(
+  tibble(
+    year = as.integer(names(daily_paths)),
+    source_path = unname(daily_paths)
+  ),
+  file.path(out_support_dir, "Final_daily_source_manifest.csv")
+)
+
+# ============================================================
+# 4) SPECIALIZED PROCESSING OUTPUT HELPERS
+# ============================================================
+
+read_results_table <- function(year_use) {
+  year_root <- file.path(processed_root, as.character(year_use))
+  path <- find_one_file(
+    year_root,
+    paste0("^Results_table_", year_use, "_U50\\.csv$"),
+    paste0("Results_table_", year_use, "_U50.csv")
+  )
+
+  read_csv(path, show_col_types = FALSE) %>%
+    mutate(
+      Year = as.integer(Year),
+      Orchard = toupper(as.character(Orchard)),
+      Period = as.character(Period)
+    )
+}
+
+results_table_all <- map_dfr(years_use, read_results_table)
+
+# Compare the final daily CSV totals with the half-hour processing summaries.
+# Small differences can occur because daily outputs apply a minimum daily-coverage
+# rule, whereas Results_table_<year>_U50.csv is calculated from available
+# half-hour fluxes. This comparison verifies provenance; it does not substitute
+# the daily totals for the authoritative annual values used in Table 1.
+daily_validation <- daily %>%
+  group_by(year) %>%
+  summarise(
+    LD_full = safe_sum(LD_NEE_gC_day),
+    MD_full = safe_sum(MD_NEE_gC_day),
+    LD_GS = safe_sum(LD_NEE_gC_day[GrowingSeason]),
+    MD_GS = safe_sum(MD_NEE_gC_day[GrowingSeason]),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = -year,
+    names_to = c("Orchard", "Period_short"),
+    names_sep = "_",
+    values_to = "Daily_CSV_NEE"
+  ) %>%
+  mutate(
+    Period = recode(
+      Period_short,
+      full = "Full-year",
+      GS = "Growing-season"
+    )
+  ) %>%
+  left_join(
+    results_table_all %>%
+      select(Year, Orchard, Period, Processed_NEE = NEE),
+    by = c("year" = "Year", "Orchard", "Period")
+  ) %>%
+  mutate(
+    Difference = Daily_CSV_NEE - Processed_NEE,
+    Absolute_difference = abs(Difference)
+  )
+
+print(daily_validation, n = Inf)
+
+write_csv(
+  daily_validation,
+  file.path(
+    out_support_dir,
+    "Final_daily_CSV_vs_processing_summary_validation.csv"
+  )
+)
+
+hard_validation_tolerance <- 10
+
+if (any(
+  daily_validation$Absolute_difference > hard_validation_tolerance,
+  na.rm = TRUE
+)) {
+  stop(
+    "A final daily CSV differs from its half-hour processing summary by more than ",
+    hard_validation_tolerance,
+    " g C m-2. Review Final_daily_CSV_vs_processing_summary_validation.csv."
+  )
+}
+
+# ============================================================
+# 5) TABLE 1: ANNUAL/SEASONAL NEE AND NECB
+# ============================================================
+
+# Annual NEE comes from the final half-hour processing summary. Seasonal NEE
+# and paired tests come from dates with valid daily values for both orchards.
+annual_nee <- results_table_all %>%
+  filter(Period == "Full-year") %>%
+  transmute(
+    year = as.integer(Year),
+    Orchard = toupper(as.character(Orchard)),
+    NEE = as.numeric(NEE)
+  ) %>%
+  pivot_wider(names_from = Orchard, values_from = NEE) %>%
+  mutate(
+    Period = "Annual NEE",
+    `MD - LD` = MD - LD,
+    p_value_numeric = NA_real_
+  )
+
+annual_necb <- annual_nee %>%
+  select(year, LD, MD) %>%
+  pivot_longer(c(LD, MD), names_to = "Orchard", values_to = "NEE") %>%
+  left_join(harvest_C, by = c("year", "Orchard")) %>%
+  mutate(NECB = NEE + Harvest_gC_m2) %>%
+  select(year, Orchard, NECB) %>%
+  pivot_wider(names_from = Orchard, values_from = NECB) %>%
+  mutate(
+    Period = "Annual NECB",
+    `MD - LD` = MD - LD,
+    p_value_numeric = NA_real_
+  )
+
+seasonal_nee <- daily %>%
+  filter(
+    !is.na(Period),
+    !is.na(LD_NEE_gC_day),
+    !is.na(MD_NEE_gC_day)
+  ) %>%
+  group_by(year, Period) %>%
+  summarise(
+    paired_days = n(),
+    LD = safe_sum(LD_NEE_gC_day),
+    MD = safe_sum(MD_NEE_gC_day),
+    `MD - LD` = safe_sum(MD_NEE_gC_day - LD_NEE_gC_day),
+    p_value_numeric = safe_ttest_p(LD_NEE_gC_day, MD_NEE_gC_day),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Period = recode(
+      as.character(Period),
+      "NGS-1" = "NGS-1 NEE",
+      "Growing season" = "Growing-season NEE",
+      "NGS-2" = "NGS-2 NEE"
+    )
+  )
+
+table1_numeric <- bind_rows(
+  annual_nee %>% select(year, Period, LD, MD, `MD - LD`, p_value_numeric),
+  annual_necb %>% select(year, Period, LD, MD, `MD - LD`, p_value_numeric),
+  seasonal_nee %>% select(year, Period, LD, MD, `MD - LD`, p_value_numeric)
+) %>%
+  mutate(
+    Period = factor(
+      Period,
+      levels = c(
+        "Annual NEE", "Annual NECB", "NGS-1 NEE",
+        "Growing-season NEE", "NGS-2 NEE"
+      )
+    )
+  ) %>%
+  arrange(year, Period)
+
+table1_display <- table1_numeric %>%
+  transmute(
+    Year = as.character(year),
+    Period = as.character(Period),
+    LD = round(LD, 0),
+    MD = round(MD, 0),
+    `MD - LD` = round(`MD - LD`, 0),
+    `p-value` = format_p(p_value_numeric)
+  )
+
+write_csv(
+  table1_numeric,
+  file.path(out_support_dir, "Table_1_numeric_support.csv")
+)
+write_csv(
+  table1_display,
+  file.path(out_table_dir, "Table_1_Annual_Seasonal_NEE_NECB.csv")
+)
+
+# ============================================================
+# 6) TABLE 2: GROWING-SEASON NEE, GPP, AND Reco
+# ============================================================
+
+metric_columns <- tribble(
+  ~Metric, ~LD_col,            ~MD_col,
+  "NEE",   "LD_NEE_gC_day",   "MD_NEE_gC_day",
+  "GPP",   "LD_GPP_gC_day",   "MD_GPP_gC_day",
+  "Reco",  "LD_Reco_gC_day",  "MD_Reco_gC_day"
+)
+
+calculate_metric_row <- function(df, year_use, metric, ld_col, md_col) {
+  x <- df %>%
+    filter(year == year_use, GrowingSeason) %>%
+    select(LD = all_of(ld_col), MD = all_of(md_col)) %>%
+    filter(is.finite(LD), is.finite(MD))
+
+  ld_total <- safe_sum(x$LD)
+  md_total <- safe_sum(x$MD)
+
+  tibble(
+    Year = year_use,
+    Metric = metric,
+    `Paired days` = nrow(x),
+    LD = ld_total,
+    MD = md_total,
+    `MD - LD` = md_total - ld_total,
+    p_value_numeric = safe_ttest_p(x$LD, x$MD)
+  )
+}
+
+table2_numeric <- tidyr::crossing(
+  Year = years_use,
+  metric_columns
+) %>%
+  pmap_dfr(
+    function(Year, Metric, LD_col, MD_col) {
+      calculate_metric_row(daily, Year, Metric, LD_col, MD_col)
+    }
+  ) %>%
+  mutate(Metric = factor(Metric, levels = c("NEE", "GPP", "Reco"))) %>%
+  arrange(Year, Metric)
+
+table2_display <- table2_numeric %>%
+  transmute(
+    Year = as.character(Year),
+    Metric = as.character(Metric),
+    LD = round(LD, 0),
+    MD = round(MD, 0),
+    `MD - LD` = round(`MD - LD`, 0),
+    `Paired days` = as.integer(`Paired days`),
+    `p-value` = format_p(p_value_numeric)
+  )
+
+write_csv(
+  table2_numeric,
+  file.path(out_support_dir, "Table_2_numeric_support.csv")
+)
+write_csv(
+  table2_display,
+  file.path(out_table_dir, "Table_2_Growing_Season_Fluxes.csv")
+)
+
+# ============================================================
+# 7) TABLE S4: ANNUAL u* QUANTILES
+# ============================================================
+
+pick_quantile_column <- function(df, probability_label) {
+  nms <- names(df)
+  exact <- which(nms == probability_label)
+  if (length(exact) == 1) return(nms[exact])
+
+  normalized <- tolower(gsub("[^a-z0-9]", "", nms))
+  target <- gsub("[^0-9]", "", probability_label)
+  hits <- which(normalized %in% c(target, paste0("x", target)))
+
+  if (length(hits) != 1) {
+    stop(
+      "Could not uniquely identify the ", probability_label,
+      " quantile column. Columns found: ", paste(nms, collapse = ", ")
+    )
+  }
+
+  nms[hits]
+}
+
+read_ustar_year <- function(year_use, orchard) {
+  year_root <- file.path(processed_root, as.character(year_use))
+
+  yearonly_pattern <- paste0(
+    "^", orchard, "_uStar_thresholds_YEARONLY_", year_use, "\\.csv$"
+  )
+
+  path <- find_one_file(
+    year_root,
+    yearonly_pattern,
+    paste0(orchard, " annual u* threshold file for ", year_use),
+    required = FALSE
+  )
+
+  if (is.na(path)) {
+    path <- find_one_file(
+      year_root,
+      paste0("^", orchard, "_uStar_thresholds_", year_use, "\\.csv$"),
+      paste0(orchard, " u* threshold distribution for ", year_use)
+    )
+  }
+
+  x <- read_csv(path, show_col_types = FALSE, name_repair = "minimal")
+
+  if ("aggregationMode" %in% names(x)) {
+    x_year <- x %>%
+      filter(tolower(as.character(aggregationMode)) == "year")
+    if (nrow(x_year) > 0) x <- x_year
+  }
+
+  if (nrow(x) != 1) {
+    stop("Expected one annual u* row in: ", path, "; found ", nrow(x))
+  }
+
+  q05_col <- pick_quantile_column(x, "5%")
+  q50_col <- pick_quantile_column(x, "50%")
+  q95_col <- pick_quantile_column(x, "95%")
+
+  out <- tibble(
+    Year = year_use,
+    Orchard = orchard,
+    `5%` = as.numeric(x[[q05_col]][1]),
+    `50%` = as.numeric(x[[q50_col]][1]),
+    `95%` = as.numeric(x[[q95_col]][1])
+  )
+
+  if (!with(out, `5%` <= `50%` && `50%` <= `95%`)) {
+    stop(
+      "The extracted u* quantiles are not monotonic for ",
+      year_use, " ", orchard, ". Check the source columns."
+    )
+  }
+
+  out
+}
+
+table_s4_numeric <- crossing(
+  Year = years_use,
+  Orchard = c("LD", "MD")
+) %>%
+  pmap_dfr(~ read_ustar_year(..1, ..2)) %>%
+  arrange(Year, factor(Orchard, levels = c("LD", "MD")))
+
+table_s4_display <- table_s4_numeric %>%
+  transmute(
+    Year = as.character(Year),
+    Orchard,
+    U05 = round(`5%`, 3),
+    U50 = round(`50%`, 3),
+    U95 = round(`95%`, 3)
+  )
+
+write_csv(
+  table_s4_numeric,
+  file.path(out_support_dir, "Table_S4_numeric_support.csv")
+)
+write_csv(
+  table_s4_display,
+  file.path(out_table_dir, "Table_S4_Annual_uStar_Thresholds.csv")
+)
+
+# ============================================================
+# 8) TABLE S5: NEE UNCERTAINTY AND GAP FILLING
+# ============================================================
+
+table_s5_numeric <- results_table_all %>%
+  mutate(
+    Year = as.integer(Year),
+    Orchard = factor(Orchard, levels = c("LD", "MD")),
+    Period = factor(Period, levels = c("Full-year", "Growing-season"))
+  ) %>%
+  arrange(Year, Orchard, Period) %>%
+  mutate(
+    Orchard = as.character(Orchard),
+    Period = as.character(Period)
+  )
+
+table_s5_display <- table_s5_numeric %>%
+  transmute(
+    Year = as.character(Year),
+    Orchard,
+    Period,
+    Days = as.integer(Days),
+    NEE = round(as.numeric(NEE), 0),
+    `Random SD` = round(as.numeric(`Random NEE SD`), 0),
+    `u* SD` = round(as.numeric(`u* Threshold NEE SD`), 0),
+    `Total SD` = round(as.numeric(`Total NEE SD`), 0),
+    `Gap-filled (%)` = round(as.numeric(`% Gap-filled`), 0)
+  )
+
+write_csv(
+  table_s5_numeric,
+  file.path(out_support_dir, "Table_S5_numeric_support.csv")
+)
+write_csv(
+  table_s5_display,
+  file.path(out_table_dir, "Table_S5_NEE_Uncertainty_Gap_Filling.csv")
+)
+
+# ============================================================
+# 9) TABLE S7: ENERGY-BALANCE CLOSURE
+# ============================================================
+
+# Include 2023 automatically when a compatible processed summary exists.
+eb_year_candidates <- c(2023L, 2024L, 2025L)
+
+read_energy_balance_year <- function(year_use) {
+  year_root <- file.path(processed_root, as.character(year_use))
+
+  if (!dir.exists(year_root)) return(NULL)
+
+  path <- find_one_file(
+    year_root,
+    paste0(
+      "^LD_energy_balance_storage_corrected_summary_",
+      year_use,
+      ".*\\.csv$"
+    ),
+    paste0("LD energy-balance summary for ", year_use),
+    required = FALSE
+  )
+
+  if (is.na(path)) return(NULL)
+
+  read_csv(path, show_col_types = FALSE) %>%
+    transmute(
+      Year = year_use,
+      `EBC window` = case_when(
+        str_detect(tolower(window), "midday") ~ "Midday GS",
+        str_detect(tolower(window), "daytime") ~ "Daytime",
+        TRUE ~ as.character(window)
+      ),
+      n = as.integer(n),
+      Slope = as.numeric(slope),
+      Intercept = as.numeric(intercept),
+      r2 = as.numeric(r2)
+    )
+}
+
+table_s7_numeric <- map_dfr(eb_year_candidates, read_energy_balance_year)
+
+if (nrow(table_s7_numeric) == 0) {
+  warning(
+    "No compatible energy-balance summary files were found. ",
+    "Table S7 was not generated."
+  )
+  table_s7_display <- tibble()
+} else {
+  table_s7_numeric <- table_s7_numeric %>%
+    mutate(
+      `EBC window` = factor(
+        `EBC window`,
+        levels = c("Daytime", "Midday GS")
+      )
+    ) %>%
+    arrange(Year, `EBC window`) %>%
+    mutate(`EBC window` = as.character(`EBC window`))
+
+  table_s7_display <- table_s7_numeric %>%
+    transmute(
+      Year = as.character(Year),
+      `EBC window`,
+      n,
+      Slope = round(Slope, 2),
+      `Intercept (W m⁻²)` = round(Intercept, 1),
+      `r²` = round(r2, 2)
+    )
+
+  write_csv(
+    table_s7_numeric,
+    file.path(out_support_dir, "Table_S7_numeric_support.csv")
+  )
+  write_csv(
+    table_s7_display,
+    file.path(out_table_dir, "Table_S7_Energy_Balance_Closure.csv")
+  )
+}
+
+
+# ============================================================
+# 10) TABLE S10: GROWING-SEASON ENVIRONMENTAL CONDITIONS
+# ============================================================
+
+# Table S10 intentionally uses the paired-day publication workbook rather than
+# the annual half-hour processing summaries. This preserves the environmental
+# comparison used in the manuscript.
+s10_workbook_path <- file.path(
+  processed_root,
+  "Fluxes_Drivers3_2024_2025.xlsx"
+)
+
+if (!file.exists(s10_workbook_path)) {
+  stop(
+    "Could not find the Table S10 workbook: ",
+    s10_workbook_path
+  )
+}
+
+s10_required_columns <- c(
+  "year", "Date", "GrowingSeason",
+  "LD_NEE_gC_day", "MD_NEE_gC_day",
+  "LD_Rg_mean_Wm2", "Tair_mean_C", "Tair_max_C",
+  "LD_TS_mean_C", "P_RAIN_tower_mm", "LD_SWC_mean"
+)
+
+s10_raw <- readxl::read_xlsx(
+  s10_workbook_path,
+  sheet = 1,
+  .name_repair = "unique"
+)
+
+s10_missing_columns <- setdiff(
+  s10_required_columns,
+  names(s10_raw)
+)
+
+if (length(s10_missing_columns) > 0) {
+  stop(
+    "The Table S10 workbook is missing required columns: ",
+    paste(s10_missing_columns, collapse = ", ")
+  )
+}
+
+s10_numeric_columns <- c(
+  "LD_NEE_gC_day", "MD_NEE_gC_day",
+  "LD_Rg_mean_Wm2", "Tair_mean_C", "Tair_max_C",
+  "LD_TS_mean_C", "P_RAIN_tower_mm", "LD_SWC_mean"
+)
+
+s10_daily <- s10_raw %>%
+  mutate(
+    Date = parse_excel_date(Date),
+    year = as.integer(readr::parse_number(as.character(year))),
+    across(
+      all_of(s10_numeric_columns),
+      ~ readr::parse_number(
+        as.character(.x),
+        na = c("", "NA", "NaN")
+      )
+    ),
+    GrowingSeason = parse_logical_flag(
+      GrowingSeason,
+      label = "GrowingSeason in Fluxes_Drivers3_2024_2025.xlsx"
+    )
+  ) %>%
+  filter(
+    !is.na(Date),
+    year %in% years_use
+  )
+
+# Retain only the median u* scenario when a scenario column is present.
+if ("scen" %in% names(s10_daily)) {
+  s10_daily <- s10_daily %>%
+    mutate(scen = toupper(trimws(as.character(scen)))) %>%
+    filter(scen == "U50")
+}
+
+if (anyDuplicated(s10_daily$Date) > 0) {
+  s10_duplicate_dates <- s10_daily %>%
+    count(Date) %>%
+    filter(n > 1)
+
+  print(s10_duplicate_dates, n = Inf)
+  stop("Duplicate dates were found in the Table S10 workbook after filtering.")
+}
+
+table_s10_numeric <- s10_daily %>%
+  filter(
+    GrowingSeason,
+    is.finite(LD_NEE_gC_day),
+    is.finite(MD_NEE_gC_day)
+  ) %>%
+  mutate(
+    paired_mean_NEE =
+      (LD_NEE_gC_day + MD_NEE_gC_day) / 2
+  ) %>%
+  group_by(year) %>%
+  summarise(
+    `GS length (d)` = n_distinct(Date),
+    `GS NEE` = safe_sum(paired_mean_NEE),
+    `Sum daily Rg` = safe_sum(LD_Rg_mean_Wm2),
+    `Mean Tair` = safe_mean(Tair_mean_C),
+    `Hot days (n)` = sum(Tair_max_C > 30, na.rm = TRUE),
+    `Mean Tsoil` = safe_mean(LD_TS_mean_C),
+    `Precipitation` = safe_sum(P_RAIN_tower_mm),
+    `Mean SWC` = safe_mean(LD_SWC_mean),
+    .groups = "drop"
+  )
+
+table_s10_display <- table_s10_numeric %>%
+  transmute(
+    Year = as.character(year),
+    `GS length (d)` = as.integer(`GS length (d)`),
+    `GS NEE (g C m⁻²)` = round(`GS NEE`, 0),
+    `Σ daily Rg (W m⁻²)` = round(`Sum daily Rg`, 0),
+    `Mean Tair (°C)` = round(`Mean Tair`, 1),
+    `Hot days (n)` = as.integer(`Hot days (n)`),
+    `Mean Tsoil (°C)` = round(`Mean Tsoil`, 1),
+    `Precipitation (mm)` = round(`Precipitation`, 0),
+    `Mean SWC (m³ m⁻³)` = round(`Mean SWC`, 3)
+  )
+
+print(table_s10_display, n = Inf)
+
+write_csv(
+  table_s10_numeric,
+  file.path(out_support_dir, "Table_S10_numeric_support.csv")
+)
+
+write_csv(
+  table_s10_display,
+  file.path(
+    out_table_dir,
+    "Table_S10_Growing_Season_Environmental_Conditions.csv"
+  )
+)
+
+# ============================================================
+# 11) FORMATTED WORD TABLE HELPERS
+# ============================================================
+
+standard_table_style <- function(ft, font_size = 11) {
+  ft %>%
+    theme_booktabs() %>%
+    font(fontname = "Helvetica", part = "all") %>%
+    fontsize(size = font_size, part = "all") %>%
+    bold(part = "header") %>%
+    valign(valign = "center", part = "all") %>%
+    padding(padding = 3, part = "all") %>%
+    autofit() %>%
+    set_table_properties(
+      layout = "autofit",
+      width = 1
+    )
+}
+caption_text_style <- officer::fp_text(
+  font.family = "Helvetica",
+  font.size = 12
+)
+
+table_note_text_style <- officer::fp_text(
+  font.family = "Helvetica",
+  font.size = 10
+)
+
+add_caption_table <- function(
+  doc,
+  caption,
+  ft,
+  footer = NULL
+) {
+
+  caption_paragraph <- officer::fpar(
+    officer::ftext(
+      caption,
+      prop = caption_text_style
+    )
+  )
+
+  doc <- doc %>%
+    officer::body_add_fpar(caption_paragraph) %>%
+    flextable::body_add_flextable(value = ft)
+
+  if (!is.null(footer)) {
+
+    footer_paragraph <- officer::fpar(
+      officer::ftext(
+        footer,
+        prop = table_note_text_style
+      )
+    )
+
+    doc <- doc %>%
+      officer::body_add_fpar(footer_paragraph)
+  }
+
+  doc
+}
+
+save_table_docx <- function(
+  ft,
+  caption,
+  path,
+  footer = NULL,
+  orientation = c("portrait", "landscape")
+) {
+  orientation <- match.arg(orientation)
+
+  doc <- read_docx() %>%
+    add_caption_table(caption, ft, footer)
+
+  doc <- if (orientation == "landscape") {
+    body_end_section_landscape(doc)
+  } else {
+    body_end_section_portrait(doc)
+  }
+
+  print(doc, target = path)
+}
+
+caption_table1 <- paste0(
+  "Table 1. Annual net ecosystem exchange (NEE), annual net ecosystem carbon ",
+  "balance (NECB), and seasonal cumulative NEE (g C m⁻²) of the low-density ",
+  "(LD) and moderate-density (MD) orchards in 2024 and 2025. Seasonal ",
+  "differences were evaluated using paired t-tests restricted to dates with ",
+  "concurrent daily observations. Annual NEE and NECB are single orchard-level ",
+  "cumulative estimates and were not statistically tested. Negative NEE and ",
+  "NECB values indicate net carbon retention. Negative MD − LD values indicate ",
+  "greater uptake or lower carbon release by MD. NGS-1 is January through the ",
+  "day before budburst; NGS-2 is November through December."
+)
+
+caption_table2 <- paste0(
+  "Table 2. Growing-season cumulative NEE, gross primary productivity (GPP), ",
+  "and ecosystem respiration (Reco; g C m⁻²) for the LD and MD orchards in ",
+  "2024 and 2025. Cumulative values and MD − LD differences were calculated ",
+  "from dates with valid daily estimates for both orchards. p-values are from ",
+  "paired t-tests of the corresponding daily fluxes."
+)
+
+caption_s4 <- paste0(
+  "Table S4. Annual friction velocity (u*) thresholds (m s⁻¹) estimated with ",
+  "the REddyProc moving point test for quantiles U05, U50, and U95. Seasonal ",
+  "u* thresholds were not applied because several seasons had insufficient ",
+  "data for physically meaningful estimates."
+)
+
+caption_s5 <- paste0(
+  "Table S5. Annual and growing-season net ecosystem exchange (NEE; g C m⁻²) ",
+  "for low-density (LD) and moderate-density (MD) apple orchards under the ",
+  "median u* scenario (U50). Random SD is the random-flux uncertainty; u* SD ",
+  "is the uncertainty associated with the u*-threshold scenario spread; Total ",
+  "SD is their root-sum-of-squares. Gap-filled (%) is the proportion of ",
+  "half-hours requiring REddyProc gap filling."
+)
+
+caption_s7 <- paste0(
+  "Table S7. Daytime and midday energy-balance closure for the low-density ",
+  "apple orchard after correction for soil heat storage. Turbulent energy ",
+  "fluxes (H + LE) were regressed against available energy (Rn − G₀). Daytime ",
+  "observations had Rg > 10 W m⁻²; midday growing-season observations included ",
+  "11:00–15:00 when Rg > 300 W m⁻²."
+)
+
+caption_s10 <- paste0(
+  "Table S10. Growing-season environmental conditions during 2024 and 2025. ",
+  "Variables were calculated for dates with concurrent daily NEE estimates ",
+  "from both orchards. Growing-season NEE represents the sum of the daily mean ",
+  "of LD and MD orchard NEE values. Σ daily Rg is the sum of daily mean incoming ",
+  "shortwave-radiation values in the publication workbook. Hot days were defined ",
+  "as days with maximum air temperature greater than 30 °C. Soil temperature and ",
+  "soil water content were measured at the LD orchard."
+)
+
+
+ft1 <- flextable(table1_display) %>%
+  merge_v(j = "Year") %>%
+  align(j = c("Year", "Period"), align = "left", part = "all") %>%
+  align(j = c("LD", "MD", "MD - LD", "p-value"), align = "right", part = "all") %>%
+  standard_table_style()
+
+ft2 <- flextable(table2_display) %>%
+  merge_v(j = "Year") %>%
+  align(j = c("Year", "Metric"), align = "left", part = "all") %>%
+  align(
+    j = c("LD", "MD", "MD - LD", "Paired days", "p-value"),
+    align = "right",
+    part = "all"
+  ) %>%
+  standard_table_style()
+
+ft_s4 <- flextable(table_s4_display) %>%
+  merge_v(j = "Year") %>%
+  align(j = c("Year", "Orchard"), align = "left", part = "all") %>%
+  align(j = c("U05", "U50", "U95"), align = "right", part = "all") %>%
+  standard_table_style()
+
+ft_s5 <- flextable(table_s5_display) %>%
+  merge_v(j = c("Year", "Orchard")) %>%
+  align(j = c("Year", "Orchard", "Period"), align = "left", part = "all") %>%
+  align(
+    j = c(
+      "Days", "NEE", "Random SD", "u* SD", "Total SD", "Gap-filled (%)"
+    ),
+    align = "right",
+    part = "all"
+  ) %>%
+  standard_table_style(font_size = 11)
+
+save_table_docx(
+  ft1,
+  caption_table1,
+  file.path(out_table_dir, "Table_1_Annual_Seasonal_NEE_NECB.docx")
+)
+
+save_table_docx(
+  ft2,
+  caption_table2,
+  file.path(out_table_dir, "Table_2_Growing_Season_Fluxes.docx")
+)
+
+save_table_docx(
+  ft_s4,
+  caption_s4,
+  file.path(out_table_dir, "Table_S4_Annual_uStar_Thresholds.docx")
+)
+
+save_table_docx(
+  ft_s5,
+  caption_s5,
+  file.path(out_table_dir, "Table_S5_NEE_Uncertainty_Gap_Filling.docx"),
+  orientation = "landscape"
+)
+
+if (nrow(table_s7_display) > 0) {
+  ft_s7 <- flextable(table_s7_display) %>%
+    merge_v(j = "Year") %>%
+    align(j = c("Year", "EBC window"), align = "left", part = "all") %>%
+    align(
+      j = c("n", "Slope", "Intercept (W m⁻²)", "r²"),
+      align = "right",
+      part = "all"
+    ) %>%
+    standard_table_style()
+
+  save_table_docx(
+    ft_s7,
+    caption_s7,
+    file.path(out_table_dir, "Table_S7_Energy_Balance_Closure.docx")
+  )
+}
+
+
+
+ft_s10 <- flextable(table_s10_display) %>%
+  align(j = "Year", align = "left", part = "body") %>%
+  align(
+    j = setdiff(names(table_s10_display), "Year"),
+    align = "right",
+    part = "body"
+  ) %>%
+  set_header_labels(
+    `GS length (d)` = "GS length\n(d)",
+    `GS NEE (g C m⁻²)` = "GS NEE\n(g C m⁻²)",
+    `Σ daily Rg (W m⁻²)` = "Σ daily Rg\n(W m⁻²)",
+    `Mean Tair (°C)` = "Mean Tair\n(°C)",
+    `Hot days (n)` = "Hot days\n(n)",
+    `Mean Tsoil (°C)` = "Mean Tsoil\n(°C)",
+    `Precipitation (mm)` = "Precipitation\n(mm)",
+    `Mean SWC (m³ m⁻³)` = "Mean SWC\n(m³ m⁻³)"
+  ) %>%
+  colformat_num(
+    j = c(
+      "GS length (d)", "GS NEE (g C m⁻²)",
+      "Σ daily Rg (W m⁻²)", "Hot days (n)",
+      "Precipitation (mm)"
+    ),
+    digits = 0,
+    big.mark = ","
+  ) %>%
+  colformat_num(
+    j = c("Mean Tair (°C)", "Mean Tsoil (°C)"),
+    digits = 1
+  ) %>%
+  colformat_num(
+    j = "Mean SWC (m³ m⁻³)",
+    digits = 3
+  ) %>%
+  standard_table_style(font_size = 11)
+
+save_table_docx(
+  ft_s10,
+  caption_s10,
+  file.path(
+    out_table_dir,
+    "Table_S10_Growing_Season_Environmental_Conditions.docx"
+  ),
+  orientation = "landscape"
+)
+
+# ============================================================
+# 12) COMBINED EXCEL AND WORD OUTPUTS
+# ============================================================
+
+xlsx_sheets <- list(
+  Table_1 = table1_display,
+  Table_1_support = table1_numeric,
+  Table_2 = table2_display,
+  Table_2_support = table2_numeric,
+  Table_S4 = table_s4_display,
+  Table_S5 = table_s5_display,
+  Table_S10 = table_s10_display,
+  Table_S10_support = table_s10_numeric,
+  Daily_CSV_validation = daily_validation,
+  Coverage_check = coverage_check
+)
+
+if (nrow(table_s7_display) > 0) {
+  xlsx_sheets$Table_S7 <- table_s7_display
+}
+
+write_xlsx(
+  xlsx_sheets,
+  file.path(out_table_dir, "Manuscript_Tables_2024_2025.xlsx")
+)
+
+# Main manuscript tables: portrait.
+main_doc <- read_docx() %>%
+  add_caption_table(caption_table1, ft1) %>%
+  body_add_break() %>%
+  add_caption_table(caption_table2, ft2) %>%
+  body_end_section_portrait()
+
+print(
+  main_doc,
+  target = file.path(out_table_dir, "Main_Manuscript_Tables_1_2.docx")
+)
+
+# Supplementary tables: S4 portrait, S5 landscape, S7 portrait, S10 landscape.
+supp_doc <- read_docx() %>%
+  add_caption_table(caption_s4, ft_s4) %>%
+  body_end_section_portrait() %>%
+  add_caption_table(caption_s5, ft_s5) %>%
+  body_end_section_landscape()
+
+if (nrow(table_s7_display) > 0) {
+  supp_doc <- supp_doc %>%
+    add_caption_table(caption_s7, ft_s7) %>%
+    body_end_section_portrait()
+}
+
+supp_doc <- supp_doc %>%
+  add_caption_table(caption_s10, ft_s10) %>%
+  body_end_section_landscape()
+
+print(
+  supp_doc,
+  target = file.path(
+    out_table_dir,
+    "Supplementary_Tables_S4_S5_S7_S10.docx"
+  )
+)
+
+# Combined review document with mixed page orientation.
+combined_doc <- read_docx() %>%
+  add_caption_table(caption_table1, ft1) %>%
+  body_add_break() %>%
+  add_caption_table(caption_table2, ft2) %>%
+  body_end_section_portrait() %>%
+  add_caption_table(caption_s4, ft_s4) %>%
+  body_end_section_portrait() %>%
+  add_caption_table(caption_s5, ft_s5) %>%
+  body_end_section_landscape()
+
+if (nrow(table_s7_display) > 0) {
+  combined_doc <- combined_doc %>%
+    add_caption_table(caption_s7, ft_s7) %>%
+    body_end_section_portrait()
+}
+
+combined_doc <- combined_doc %>%
+  add_caption_table(caption_s10, ft_s10) %>%
+  body_end_section_landscape()
+
+print(
+  combined_doc,
+  target = file.path(out_table_dir, "Manuscript_Tables_2024_2025.docx")
+)
+
+# ============================================================
+# 13) TABLE PROVENANCE AND SESSION INFORMATION
+# ============================================================
+
+provenance <- tribble(
+  ~manuscript_item, ~primary_input, ~calculation,
+  "Table 1", "Results_table_<year>_U50.csv plus final annual daily U50 CSVs",
+  "Annual NEE from the final half-hour processing summary; NECB = annual NEE + harvested fruit C; seasonal NEE and paired t-tests from final daily CSVs",
+  "Table 2", paste(basename(unname(daily_paths)), collapse = "; "),
+  "Growing-season paired-date cumulative NEE, GPP, Reco and paired t-tests from final daily U50 processing outputs",
+  "Table S4", "LD/MD_uStar_thresholds_YEARONLY_<year>.csv",
+  "Annual REddyProc bootstrap quantile columns 5%, 50%, and 95%, displayed as U05, U50, and U95",
+  "Table S5", "Results_table_<year>_U50.csv",
+  "Final U50 NEE uncertainty and percentage gap-filled outputs",
+  "Table S7", "LD_energy_balance_storage_corrected_summary_<year>_10spike.csv",
+  "Regression of H + LE against Rn - G0 for daytime and midday growing-season windows",
+  "Table S10", basename(s10_workbook_path),
+  "Paired-day growing-season environmental summary and sum of the daily mean LD and MD NEE values"
+)
+
+write_csv(
+  provenance,
+  file.path(out_docs_dir, "table_provenance.csv")
+)
+
+capture.output(
+  sessionInfo(),
+  file = file.path(out_table_dir, "sessionInfo_manuscript_tables.txt")
+)
+
+cat(
+  "\nManuscript table workflow completed successfully.",
+  "\nFinal daily files:", paste(unname(daily_paths), collapse = " | "),
+  "\nTable S10 workbook:", s10_workbook_path,
+  "\nTables written to:", out_table_dir,
+  "\nSupporting calculations written to:", out_support_dir,
+  "\n"
+)
+```

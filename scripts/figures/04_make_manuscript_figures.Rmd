@@ -1,0 +1,1051 @@
+---
+title: "Manuscript Figures: Apple Orchard Eddy-Covariance Study"
+author: "Kevin Postma"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.align = "center"
+)
+```
+
+# Purpose
+
+This script generates publication-quality versions of:
+
+- **Figure 2:** cumulative growing-season precipitation in 2024 and 2025;
+- **Figure 3:** chained cumulative NECB with weekly paired NEE differences.
+
+Figure 2 is derived from `Fluxes_Drivers3_2024_2025.xlsx`. Figure 3 is derived from the final annual U50 daily processing CSVs so that it reflects the winter positive/negative reviews and the seeded REddyProc processing runs.
+
+```{r packages_paths_helpers}
+# ============================================================
+# 0) PACKAGES
+# ============================================================
+
+required_packages <- c(
+  "dplyr", "tidyr", "readr", "readxl", "lubridate",
+  "ggplot2", "patchwork", "purrr", "stringr", "tibble", "here"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install the following packages before knitting this script: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(readxl)
+  library(lubridate)
+  library(ggplot2)
+  library(patchwork)
+  library(purrr)
+  library(stringr)
+  library(tibble)
+  library(here)
+})
+
+# ============================================================
+# 1) PROJECT PATHS
+# ============================================================
+
+project_root <- here::here()
+processed_root <- file.path(project_root, "data", "processed")
+
+figure_main_dir <- file.path(project_root, "figures", "manuscript")
+figure_support_dir <- file.path(
+  processed_root, "publication", "figure_support"
+)
+
+walk(
+  c(figure_main_dir, figure_support_dir),
+  ~ dir.create(.x, recursive = TRUE, showWarnings = FALSE)
+)
+
+figure2_workbook <- file.path(
+  processed_root,
+  "Fluxes_Drivers3_2024_2025.xlsx"
+)
+
+if (!file.exists(figure2_workbook)) {
+  stop(
+    "Could not find Fluxes_Drivers3_2024_2025.xlsx at: ",
+    figure2_workbook,
+    "\nOpen the apple-orchard-eddy-covariance RStudio project and try again."
+  )
+}
+
+message("Project root: ", project_root)
+message("Figure output directory: ", figure_main_dir)
+
+# ============================================================
+# 2) STUDY METADATA
+# ============================================================
+
+years_use <- c(2024L, 2025L)
+
+# Phenology-based growing-season dates.
+gs_dates <- tribble(
+  ~year, ~gs_start,             ~gs_end,
+  2024L, as.Date("2024-03-28"), as.Date("2024-10-31"),
+  2025L, as.Date("2025-04-15"), as.Date("2025-10-31")
+)
+
+# Harvested-fruit carbon export and plotting dates.
+# Change HarvestDate here if a different accounting date is preferred.
+harvest_C <- tribble(
+  ~year, ~Orchard, ~Harvest_gC_m2, ~HarvestDate,
+  2024L, "LD", 177, as.Date("2024-11-01"),
+  2024L, "MD", 337, as.Date("2024-11-01"),
+  2025L, "LD",  68, as.Date("2025-11-01"),
+  2025L, "MD", 331, as.Date("2025-11-01")
+)
+
+# Publication colors.
+# LD is blue and MD is orange. Figure 2 uses blue for 2024 and orange for 2025.
+orchard_colors <- c(
+  "LD" = "#0072B2",
+  "MD" = "#D55E00"
+)
+
+year_colors <- c(
+  "2024" = "#0072B2",
+  "2025" = "#E69F00"
+)
+
+# ============================================================
+# 3) GENERAL HELPERS
+# ============================================================
+
+safe_sum <- function(x) {
+  if (all(is.na(x))) NA_real_ else sum(x, na.rm = TRUE)
+}
+
+parse_date_safely <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  if (inherits(x, "POSIXt")) return(as.Date(x))
+  if (is.numeric(x)) return(as.Date(x, origin = "1899-12-30"))
+
+  x_chr <- trimws(as.character(x))
+  out <- suppressWarnings(lubridate::ymd(x_chr, quiet = TRUE))
+
+  unresolved <- is.na(out) & nzchar(x_chr)
+  if (any(unresolved)) {
+    out[unresolved] <- suppressWarnings(
+      lubridate::mdy(x_chr[unresolved], quiet = TRUE)
+    )
+  }
+
+  as.Date(out)
+}
+
+parse_logical_flag <- function(x, label = "logical column") {
+  if (is.logical(x)) return(x)
+
+  x_chr <- tolower(trimws(as.character(x)))
+
+  out <- case_when(
+    is.na(x_chr) | x_chr == "" ~ NA,
+    x_chr %in% c("true", "t", "1", "yes", "y") ~ TRUE,
+    x_chr %in% c("false", "f", "0", "no", "n") ~ FALSE,
+    TRUE ~ NA
+  )
+
+  invalid <- !is.na(x_chr) & x_chr != "" & is.na(out)
+
+  if (any(invalid)) {
+    stop(
+      label,
+      " contains values that cannot be interpreted as TRUE or FALSE: ",
+      paste(sort(unique(x_chr[invalid])), collapse = ", ")
+    )
+  }
+
+  out
+}
+
+find_one_file <- function(root, pattern, label) {
+  hits <- list.files(
+    root,
+    pattern = pattern,
+    full.names = TRUE,
+    recursive = TRUE,
+    ignore.case = TRUE
+  )
+
+  hits <- hits[!grepl("(^|/|\\\\)~\\$", hits)]
+
+  if (length(hits) == 0) {
+    stop("Could not find ", label, " under: ", root)
+  }
+
+  if (length(hits) > 1) {
+    stop(
+      "Found more than one possible ", label, ":\n",
+      paste(hits, collapse = "\n")
+    )
+  }
+
+  hits[[1]]
+}
+
+resolve_daily_csv <- function(year_use) {
+  year_root <- file.path(processed_root, as.character(year_use))
+
+  find_one_file(
+    year_root,
+    paste0(
+      "^Daily_LD_MD_Fluxes_plus_Drivers_plus_VPD_",
+      year_use,
+      "_U50\\.csv$"
+    ),
+    paste0("final daily U50 flux-and-driver file for ", year_use)
+  )
+}
+
+resolve_results_table <- function(year_use) {
+  year_root <- file.path(processed_root, as.character(year_use))
+
+  find_one_file(
+    year_root,
+    paste0("^Results_table_", year_use, "_U50\\.csv$"),
+    paste0("final Results_table for ", year_use)
+  )
+}
+
+publication_theme <- function(base_size = 11) {
+  theme_bw(base_size = base_size, base_family = "Helvetica") +
+    theme(
+      text = element_text(family = "Helvetica", color = "black"),
+      axis.title = element_text(size = 12, face = "bold"),
+      axis.text = element_text(size = 10, color = "black"),
+      legend.title = element_text(size = 11, face = "bold"),
+      legend.text = element_text(size = 10),
+      strip.text = element_text(size = 11, face = "bold"),
+      plot.tag = element_text(size = 12, face = "bold"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.margin = margin(6, 8, 6, 8)
+    )
+}
+
+save_publication_figure <- function(
+  plot,
+  basename,
+  width,
+  height
+) {
+  png_path <- file.path(figure_main_dir, paste0(basename, ".png"))
+  tiff_path <- file.path(figure_main_dir, paste0(basename, ".tiff"))
+  pdf_path <- file.path(figure_main_dir, paste0(basename, ".pdf"))
+
+  ggsave(
+    filename = png_path,
+    plot = plot,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = 300,
+    bg = "white"
+  )
+
+  ggsave(
+    filename = tiff_path,
+    plot = plot,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = 600,
+    compression = "lzw",
+    bg = "white"
+  )
+
+  pdf_device <- if (capabilities("cairo")) {
+    grDevices::cairo_pdf
+  } else {
+    grDevices::pdf
+  }
+
+  ggsave(
+    filename = pdf_path,
+    plot = plot,
+    width = width,
+    height = height,
+    units = "in",
+    device = pdf_device,
+    bg = "white"
+  )
+
+  created <- c(png_path, tiff_path, pdf_path)
+  missing <- created[!file.exists(created)]
+
+  if (length(missing) > 0) {
+    stop("One or more figure files were not created: ", paste(missing, collapse = ", "))
+  }
+
+  message("Saved figure files: ", paste(created, collapse = " | "))
+}
+```
+
+# Load final daily flux data for Figure 3
+
+```{r load_final_daily_fluxes}
+# ============================================================
+# 4) FINAL DAILY U50 FLUX FILES FOR FIGURE 3
+# ============================================================
+
+daily_paths <- set_names(
+  map_chr(years_use, resolve_daily_csv),
+  as.character(years_use)
+)
+
+walk2(
+  names(daily_paths),
+  unname(daily_paths),
+  ~ message("Final daily processing file for ", .x, ": ", .y)
+)
+
+read_final_daily_year <- function(path, year_use) {
+  x <- read_csv(
+    path,
+    show_col_types = FALSE,
+    na = c("", "NA", "NaN")
+  )
+
+  required <- c("Date", "LD_NEE_gC_day", "MD_NEE_gC_day")
+  missing <- setdiff(required, names(x))
+
+  if (length(missing) > 0) {
+    stop(
+      "The final daily file for ", year_use,
+      " is missing: ", paste(missing, collapse = ", "),
+      "\nFile: ", path
+    )
+  }
+
+  x <- x %>%
+    mutate(
+      Date = parse_date_safely(Date),
+      LD_NEE_gC_day = parse_number(as.character(LD_NEE_gC_day)),
+      MD_NEE_gC_day = parse_number(as.character(MD_NEE_gC_day))
+    ) %>%
+    filter(!is.na(Date))
+
+  outside_year <- x %>%
+    filter(lubridate::year(Date) != year_use)
+
+  if (nrow(outside_year) > 0) {
+    message(
+      "Removing ", nrow(outside_year),
+      " boundary-date row(s) from the ", year_use,
+      " daily file: ",
+      paste(sort(unique(as.character(outside_year$Date))), collapse = ", ")
+    )
+  }
+
+  x %>%
+    filter(lubridate::year(Date) == year_use) %>%
+    transmute(
+      year = as.integer(year_use),
+      Date,
+      LD_NEE_gC_day,
+      MD_NEE_gC_day,
+      source_file = basename(path)
+    )
+}
+
+final_daily <- map2_dfr(
+  unname(daily_paths),
+  years_use,
+  read_final_daily_year
+) %>%
+  arrange(Date)
+
+if (anyDuplicated(final_daily$Date) > 0) {
+  duplicate_dates <- final_daily %>%
+    count(Date) %>%
+    filter(n > 1)
+
+  print(duplicate_dates, n = Inf)
+  stop("Duplicate dates remain in the final daily files.")
+}
+
+write_csv(
+  tibble(
+    year = as.integer(names(daily_paths)),
+    daily_source_path = unname(daily_paths)
+  ),
+  file.path(figure_support_dir, "Figure_3_daily_source_manifest.csv")
+)
+
+# Compare daily-file annual sums with the authoritative half-hour summaries.
+# Small differences can occur because the daily products apply a daily coverage rule.
+results_paths <- set_names(
+  map_chr(years_use, resolve_results_table),
+  as.character(years_use)
+)
+
+results_table_all <- map_dfr(
+  years_use,
+  function(year_use) {
+    read_csv(results_paths[[as.character(year_use)]], show_col_types = FALSE) %>%
+      mutate(
+        Year = as.integer(Year),
+        Orchard = toupper(as.character(Orchard)),
+        Period = as.character(Period)
+      )
+  }
+)
+
+figure3_validation <- final_daily %>%
+  group_by(year) %>%
+  summarise(
+    LD = safe_sum(LD_NEE_gC_day),
+    MD = safe_sum(MD_NEE_gC_day),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(c(LD, MD), names_to = "Orchard", values_to = "Daily_NEE") %>%
+  left_join(
+    results_table_all %>%
+      filter(Period == "Full-year") %>%
+      select(year = Year, Orchard, Official_NEE = NEE),
+    by = c("year", "Orchard")
+  ) %>%
+  mutate(
+    Difference = Daily_NEE - Official_NEE,
+    Absolute_difference = abs(Difference)
+  )
+
+print(figure3_validation, n = Inf)
+
+write_csv(
+  figure3_validation,
+  file.path(
+    figure_support_dir,
+    "Figure_3_daily_vs_official_annual_NEE_validation.csv"
+  )
+)
+
+if (any(figure3_validation$Absolute_difference > 10, na.rm = TRUE)) {
+  stop(
+    "A final daily CSV differs from the official annual NEE by more than 10 g C m-2. ",
+    "Review Figure_3_daily_vs_official_annual_NEE_validation.csv."
+  )
+}
+
+if (any(figure3_validation$Absolute_difference > 1.1, na.rm = TRUE)) {
+  warning(
+    "Figure 3 daily trajectories differ slightly from one or more official annual totals. ",
+    "This is expected when low-coverage daily values are omitted; see the validation CSV."
+  )
+}
+```
+
+# Figure 2: cumulative precipitation
+
+```{r figure_2}
+# ============================================================
+# 5) FIGURE 2: CUMULATIVE GROWING-SEASON PRECIPITATION
+# ============================================================
+
+figure2_raw <- read_excel(
+  figure2_workbook,
+  sheet = 1,
+  .name_repair = "unique"
+)
+
+required_figure2_columns <- c(
+  "Date", "year", "P_RAIN_tower_mm"
+)
+
+missing_figure2_columns <- setdiff(
+  required_figure2_columns,
+  names(figure2_raw)
+)
+
+if (length(missing_figure2_columns) > 0) {
+  stop(
+    "Fluxes_Drivers3_2024_2025.xlsx is missing columns required for Figure 2: ",
+    paste(missing_figure2_columns, collapse = ", ")
+  )
+}
+
+figure2_daily <- figure2_raw %>%
+  mutate(
+    Date = parse_date_safely(Date),
+    year = as.integer(parse_number(as.character(year))),
+    P_RAIN_tower_mm = parse_number(as.character(P_RAIN_tower_mm))
+  ) %>%
+  filter(
+    year %in% years_use,
+    !is.na(Date)
+  ) %>%
+  left_join(gs_dates, by = "year") %>%
+  mutate(
+    GrowingSeason_calc = Date >= gs_start & Date <= gs_end
+  ) %>%
+  filter(GrowingSeason_calc) %>%
+  arrange(year, Date)
+
+# Validate the workbook's GrowingSeason field when it is present.
+if ("GrowingSeason" %in% names(figure2_raw)) {
+  gs_check <- figure2_raw %>%
+    mutate(
+      Date = parse_date_safely(Date),
+      year = as.integer(parse_number(as.character(year))),
+      GrowingSeason_source = parse_logical_flag(
+        GrowingSeason,
+        label = "GrowingSeason in Fluxes_Drivers3_2024_2025.xlsx"
+      )
+    ) %>%
+    filter(year %in% years_use, !is.na(Date)) %>%
+    left_join(gs_dates, by = "year") %>%
+    mutate(
+      GrowingSeason_calc = Date >= gs_start & Date <= gs_end
+    ) %>%
+    filter(
+      !is.na(GrowingSeason_source),
+      GrowingSeason_source != GrowingSeason_calc
+    )
+
+  if (nrow(gs_check) > 0) {
+    print(gs_check, n = Inf)
+    stop(
+      "GrowingSeason values in Fluxes_Drivers3_2024_2025.xlsx do not match ",
+      "the documented phenology dates."
+    )
+  }
+}
+
+missing_rain <- figure2_daily %>%
+  filter(!is.finite(P_RAIN_tower_mm))
+
+if (nrow(missing_rain) > 0) {
+  print(missing_rain %>% select(year, Date, P_RAIN_tower_mm), n = Inf)
+  stop(
+    "Figure 2 contains missing tower-precipitation values during the growing season. ",
+    "Do not silently replace these with zero."
+  )
+}
+
+figure2_support <- figure2_daily %>%
+  group_by(year) %>%
+  mutate(
+    Cumulative_precipitation_mm = cumsum(P_RAIN_tower_mm)
+  ) %>%
+  ungroup() %>%
+  transmute(
+    Year = factor(year, levels = years_use),
+    Date,
+    PlotDate = as.Date(paste0("2000-", format(Date, "%m-%d"))),
+    Daily_precipitation_mm = P_RAIN_tower_mm,
+    Cumulative_precipitation_mm
+  )
+
+figure2_totals <- figure2_support %>%
+  group_by(Year) %>%
+  summarise(
+    Growing_season_days = n_distinct(Date),
+    Total_precipitation_mm = sum(Daily_precipitation_mm),
+    .groups = "drop"
+  )
+
+print(figure2_totals, n = Inf)
+
+write_csv(
+  figure2_support,
+  file.path(figure_support_dir, "Figure_2_cumulative_precipitation_support.csv")
+)
+
+write_csv(
+  figure2_totals,
+  file.path(figure_support_dir, "Figure_2_precipitation_totals.csv")
+)
+
+p_figure2 <- ggplot(
+  figure2_support,
+  aes(
+    x = PlotDate,
+    y = Cumulative_precipitation_mm,
+    color = Year,
+    group = Year
+  )
+) +
+  geom_step(linewidth = 1.15, direction = "hv") +
+  scale_color_manual(
+    values = year_colors,
+    breaks = c("2024", "2025")
+  ) +
+  scale_x_date(
+    limits = c(as.Date("2000-03-20"), as.Date("2000-11-10")),
+    date_breaks = "1 month",
+    date_labels = "%b",
+    expand = expansion(mult = c(0.01, 0.02))
+  ) +
+  scale_y_continuous(
+    limits = c(0, NA),
+    expand = expansion(mult = c(0, 0.06))
+  ) +
+  labs(
+    x = "Month",
+    y = "Cumulative precipitation (mm)",
+    color = "Year"
+  ) +
+  publication_theme(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = c(0.78, 0.30),
+    legend.background = element_rect(
+      fill = "white",
+      color = NA
+    )
+  )
+
+print(p_figure2)
+
+save_publication_figure(
+  p_figure2,
+  basename = "Figure_2_Cumulative_Growing_Season_Precipitation_2024_2025",
+  width = 7.2,
+  height = 4.8
+)
+```
+
+# Figure 3: chained cumulative NECB and weekly NEE difference
+
+```{r figure_3}
+# ============================================================
+# 6) FIGURE 3: CHAINED CUMULATIVE NECB + WEEKLY NEE DIFFERENCE
+# ============================================================
+
+# Orchard-specific daily NEE trajectories. Each orchard retains all of its
+# available daily values; the upper panel is not restricted to paired days.
+daily_necb_long <- final_daily %>%
+  select(Date, year, LD_NEE_gC_day, MD_NEE_gC_day) %>%
+  pivot_longer(
+    cols = c(LD_NEE_gC_day, MD_NEE_gC_day),
+    names_to = "Orchard",
+    values_to = "NEE_gC_m2_day"
+  ) %>%
+  mutate(
+    Orchard = recode(
+      Orchard,
+      "LD_NEE_gC_day" = "LD",
+      "MD_NEE_gC_day" = "MD"
+    ),
+    Orchard = factor(Orchard, levels = c("LD", "MD"))
+  ) %>%
+  filter(is.finite(NEE_gC_m2_day))
+
+harvest_events <- harvest_C %>%
+  transmute(
+    Date = HarvestDate,
+    Orchard = factor(Orchard, levels = c("LD", "MD")),
+    NECB_increment_gC_m2 = Harvest_gC_m2,
+    Increment_type = "Harvested-fruit export"
+  )
+
+daily_events <- daily_necb_long %>%
+  transmute(
+    Date,
+    Orchard,
+    NECB_increment_gC_m2 = NEE_gC_m2_day,
+    Increment_type = "Daily NEE"
+  )
+
+# Add a zero starting point so both trajectories visibly begin at zero.
+start_rows <- tibble(
+  Date = as.Date("2023-12-31"),
+  Orchard = factor(c("LD", "MD"), levels = c("LD", "MD")),
+  NECB_increment_gC_m2 = 0,
+  Increment_type = "Starting value"
+)
+
+figure3_necb_support <- bind_rows(
+  start_rows,
+  daily_events,
+  harvest_events
+) %>%
+  group_by(Orchard, Date) %>%
+  summarise(
+    NECB_increment_gC_m2 = sum(NECB_increment_gC_m2, na.rm = TRUE),
+    Increment_type = paste(sort(unique(Increment_type)), collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  arrange(Orchard, Date) %>%
+  group_by(Orchard) %>%
+  mutate(
+    Cumulative_NECB_gC_m2 = cumsum(NECB_increment_gC_m2)
+  ) %>%
+  ungroup()
+
+# Weekly difference uses paired daily dates because it directly compares orchards.
+# Difference = MD - LD:
+#   positive -> LD had greater uptake or lower CO2 release;
+#   negative -> MD had greater uptake or lower CO2 release.
+figure3_weekly_support <- final_daily %>%
+  filter(
+    is.finite(LD_NEE_gC_day),
+    is.finite(MD_NEE_gC_day)
+  ) %>%
+  mutate(
+    Daily_difference_MD_minus_LD = MD_NEE_gC_day - LD_NEE_gC_day,
+    Week = floor_date(Date, unit = "week", week_start = 1)
+  ) %>%
+  group_by(Week) %>%
+  summarise(
+    Paired_days = n(),
+    Weekly_difference_MD_minus_LD = sum(
+      Daily_difference_MD_minus_LD,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Advantage = case_when(
+      Weekly_difference_MD_minus_LD > 0 ~ "LD",
+      Weekly_difference_MD_minus_LD < 0 ~ "MD",
+      TRUE ~ "Equal"
+    ),
+    Bar_color = case_when(
+      Advantage == "LD" ~ unname(orchard_colors["LD"]),
+      Advantage == "MD" ~ unname(orchard_colors["MD"]),
+      TRUE ~ "grey60"
+    )
+  )
+
+write_csv(
+  figure3_necb_support,
+  file.path(figure_support_dir, "Figure_3_chained_NECB_support.csv")
+)
+
+write_csv(
+  figure3_weekly_support,
+  file.path(figure_support_dir, "Figure_3_weekly_NEE_difference_support.csv")
+)
+
+figure3_endpoints <- figure3_necb_support %>%
+  group_by(Orchard) %>%
+  slice_max(Date, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(Orchard, Date, Cumulative_NECB_gC_m2)
+
+print(figure3_endpoints, n = Inf)
+
+# Growing-season shading and labels.
+growing_seasons <- gs_dates %>%
+  transmute(
+    year,
+    xmin = gs_start,
+    xmax = gs_end,
+    xmid = gs_start + as.integer((gs_end - gs_start) / 2),
+    label = paste0(year, "\nGrowing season")
+  )
+
+harvest_labels <- harvest_C %>%
+  distinct(HarvestDate) %>%
+  transmute(
+    Date = HarvestDate,
+    label = "Harvest"
+  )
+
+x_limits <- c(as.Date("2023-12-15"), as.Date("2025-12-31"))
+month_breaks <- seq(
+  as.Date("2024-01-01"),
+  as.Date("2025-12-01"),
+  by = "1 month"
+)
+
+necb_range <- range(
+  figure3_necb_support$Cumulative_NECB_gC_m2,
+  na.rm = TRUE
+)
+
+necb_span <- diff(necb_range)
+if (!is.finite(necb_span) || necb_span == 0) necb_span <- 1
+
+upper_label_y <- necb_range[2] - 0.06 * necb_span
+harvest_label_y <- necb_range[2] - 0.18 * necb_span
+
+weekly_range <- range(
+  figure3_weekly_support$Weekly_difference_MD_minus_LD,
+  na.rm = TRUE
+)
+
+weekly_positive_y <- max(0, weekly_range[2]) * 0.72
+weekly_negative_y <- min(0, weekly_range[1]) * 0.72
+
+if (!is.finite(weekly_positive_y) || weekly_positive_y == 0) {
+  weekly_positive_y <- 1
+}
+
+if (!is.finite(weekly_negative_y) || weekly_negative_y == 0) {
+  weekly_negative_y <- -1
+}
+
+p_figure3_top <- ggplot(
+  figure3_necb_support,
+  aes(
+    x = Date,
+    y = Cumulative_NECB_gC_m2,
+    color = Orchard
+  )
+) +
+  geom_rect(
+    data = growing_seasons,
+    aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+    inherit.aes = FALSE,
+    fill = "grey85",
+    alpha = 0.55
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  geom_vline(
+    data = harvest_labels,
+    aes(xintercept = Date),
+    inherit.aes = FALSE,
+    linetype = "dotted",
+    linewidth = 0.55
+  ) +
+  geom_line(linewidth = 1.05, na.rm = TRUE) +
+  geom_text(
+    data = growing_seasons,
+    aes(x = xmid, y = upper_label_y, label = label),
+    inherit.aes = FALSE,
+    family = "Helvetica",
+    fontface = "bold",
+    size = 3.8,
+    lineheight = 0.9,
+    color = "black"
+  ) +
+  geom_text(
+    data = harvest_labels,
+    aes(x = Date, y = harvest_label_y, label = label),
+    inherit.aes = FALSE,
+    family = "Helvetica",
+    angle = 90,
+    vjust = -0.5,
+    size = 3.2,
+    color = "black"
+  ) +
+  scale_color_manual(
+    values = orchard_colors,
+    breaks = c("LD", "MD")
+  ) +
+  scale_x_date(
+    limits = x_limits,
+    breaks = month_breaks,
+    labels = function(x) lubridate::month(x),
+    expand = c(0, 0)
+  ) +
+  labs(
+    tag = "a",
+    x = NULL,
+    y = "Chained cumulative NECB (g C m⁻²)",
+    color = "Orchard"
+  ) +
+  publication_theme(base_size = 11) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = c(0.94, 0.13),
+    legend.justification = c(1, 0),
+    legend.background = element_rect(
+      fill = "white",
+      color = "grey70"
+    ),
+    panel.grid.major.y = element_line(color = "grey88", linewidth = 0.35)
+  )
+
+p_figure3_bottom <- ggplot(
+  figure3_weekly_support,
+  aes(
+    x = Week,
+    y = Weekly_difference_MD_minus_LD
+  )
+) +
+  geom_rect(
+    data = growing_seasons,
+    aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+    inherit.aes = FALSE,
+    fill = "grey85",
+    alpha = 0.55
+  ) +
+  geom_col(
+    aes(fill = Bar_color),
+    width = 6,
+    color = "black",
+    linewidth = 0.12
+  ) +
+  scale_fill_identity() +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  geom_vline(
+    data = harvest_labels,
+    aes(xintercept = Date),
+    inherit.aes = FALSE,
+    linetype = "dotted",
+    linewidth = 0.55
+  ) +
+  annotate(
+    "text",
+    x = as.Date("2024-02-01"),
+    y = weekly_positive_y,
+    label = "LD greater uptake\nor lower CO₂ release",
+    hjust = 0,
+    family = "Helvetica",
+    fontface = "bold",
+    size = 3.1,
+    lineheight = 0.9,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = as.Date("2024-02-01"),
+    y = weekly_negative_y,
+    label = "MD greater uptake\nor lower CO₂ release",
+    hjust = 0,
+    family = "Helvetica",
+    fontface = "bold",
+    size = 3.1,
+    lineheight = 0.9,
+    color = "black"
+  ) +
+  scale_x_date(
+    limits = x_limits,
+    breaks = month_breaks,
+    labels = function(x) lubridate::month(x),
+    expand = c(0, 0)
+  ) +
+  labs(
+    tag = "b",
+    x = "Month of year",
+    y = "Weekly NEE difference, MD − LD\n(g C m⁻² wk⁻¹)"
+  ) +
+  publication_theme(base_size = 11) +
+  theme(
+    legend.position = "none",
+    panel.grid.major.y = element_line(color = "grey88", linewidth = 0.35)
+  )
+
+p_figure3 <- p_figure3_top / p_figure3_bottom +
+  plot_layout(heights = c(3.5, 1.35))
+
+print(p_figure3)
+
+save_publication_figure(
+  p_figure3,
+  basename = "Figure_3_Chained_Cumulative_NECB_Weekly_NEE_Difference_2024_2025",
+  width = 7.2,
+  height = 7.1
+)
+```
+
+# Figure captions and provenance
+
+```{r captions_provenance}
+# ============================================================
+# 7) CAPTIONS, PROVENANCE, AND SESSION INFORMATION
+# ============================================================
+
+rain_total_2024 <- figure2_totals %>%
+  filter(as.character(Year) == "2024") %>%
+  pull(Total_precipitation_mm) %>%
+  round(0)
+
+rain_total_2025 <- figure2_totals %>%
+  filter(as.character(Year) == "2025") %>%
+  pull(Total_precipitation_mm) %>%
+  round(0)
+
+figure2_caption <- paste0(
+  "Figure 2. Cumulative growing-season precipitation measured at the ",
+  "low-density (LD) orchard eddy-covariance tower in 2024 and 2025. ",
+  "Curves begin at budbreak on 28 March 2024 and 15 April 2025 and extend ",
+  "through 31 October. Total growing-season precipitation was ",
+  rain_total_2024, " mm in 2024 and ", rain_total_2025, " mm in 2025. ",
+  "Although precipitation accumulated more slowly during much of June through ",
+  "mid-August 2025, several late-season rainfall events resulted in the greater ",
+  "2025 total."
+)
+
+figure3_caption <- paste0(
+  "Figure 3. Chained cumulative net ecosystem carbon balance (NECB; upper ",
+  "panel) and weekly differences in net ecosystem exchange (NEE; lower panel) ",
+  "for the low-density (LD) and moderate-density (MD) apple orchards during ",
+  "2024 and 2025. Cumulative NECB was calculated by continuously accumulating ",
+  "daily NEE across both years and adding harvested-fruit carbon as an ecosystem ",
+  "export at each harvest, indicated by the vertical dotted lines. The 2025 ",
+  "trajectories therefore begin from the ending 2024 carbon balances rather ",
+  "than resetting to zero. Negative cumulative NECB values indicate net carbon ",
+  "retention within the orchard ecosystem. Gray shading denotes the growing ",
+  "seasons. Lower-panel bars represent weekly MD − LD NEE differences. Positive ",
+  "values indicate greater carbon uptake or lower CO₂ release by LD, whereas ",
+  "negative values indicate greater carbon uptake or lower CO₂ release by MD. ",
+  "Dashed horizontal lines indicate zero."
+)
+
+caption_lines <- c(
+  figure2_caption,
+  "",
+  figure3_caption
+)
+
+writeLines(
+  caption_lines,
+  con = file.path(figure_main_dir, "Figure_2_and_Figure_3_captions.txt")
+)
+
+figure_provenance <- tribble(
+  ~Figure, ~Primary_source, ~Calculation,
+  "Figure 2",
+  basename(figure2_workbook),
+  "Growing-season cumulative sum of P_RAIN_tower_mm using documented phenology dates",
+  "Figure 3 upper panel",
+  paste(basename(unname(daily_paths)), collapse = "; "),
+  "Orchard-specific daily U50 NEE accumulated continuously across 2024-2025; harvested-fruit carbon added as export",
+  "Figure 3 lower panel",
+  paste(basename(unname(daily_paths)), collapse = "; "),
+  "Weekly sum of paired daily MD minus LD NEE differences"
+)
+
+write_csv(
+  figure_provenance,
+  file.path(figure_support_dir, "figure_provenance.csv")
+)
+
+capture.output(
+  sessionInfo(),
+  file = file.path(figure_main_dir, "sessionInfo_manuscript_figures.txt")
+)
+
+cat(
+  "\nManuscript figure workflow completed successfully.",
+  "\nFigure files written to: ", figure_main_dir,
+  "\nSupport files written to: ", figure_support_dir,
+  "\n",
+  sep = ""
+)
+```

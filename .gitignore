@@ -1,0 +1,14 @@
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+data/raw/
+
+# Generated manual-review context images
+data/manual_review/**/*_context.png
+
+# Obsolete manual-review backup files
+data/manual_review/**/*_old_*.csv
+data/manual_review/**/*backup*.csv
+data/manual_review/**/* copy*.csv

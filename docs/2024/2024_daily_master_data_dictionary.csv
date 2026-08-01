@@ -1,0 +1,30 @@
+column,units,description
+Date,date,Calendar date
+LD_NEE_gC_day,g C m-2 day-1,Daily U50 net ecosystem exchange for the low-density orchard; negative values indicate net uptake
+MD_NEE_gC_day,g C m-2 day-1,Daily U50 net ecosystem exchange for the moderate-density orchard; negative values indicate net uptake
+LD_GPP_gC_day,g C m-2 day-1,Daily U50 gross primary production for the low-density orchard
+MD_GPP_gC_day,g C m-2 day-1,Daily U50 gross primary production for the moderate-density orchard
+LD_Reco_gC_day,g C m-2 day-1,Daily U50 ecosystem respiration for the low-density orchard
+MD_Reco_gC_day,g C m-2 day-1,Daily U50 ecosystem respiration for the moderate-density orchard
+LD_VPD_mean_kPa,kPa,Mean daily vapor-pressure deficit for the low-density orchard
+MD_VPD_mean_kPa,kPa,Mean daily vapor-pressure deficit for the moderate-density orchard
+LD_VPD_day_kPa,kPa,Mean daytime vapor-pressure deficit for the low-density orchard
+MD_VPD_day_kPa,kPa,Mean daytime vapor-pressure deficit for the moderate-density orchard
+LD_VPD_midday_kPa,kPa,Mean 11:00-15:59 vapor-pressure deficit for the low-density orchard
+MD_VPD_midday_kPa,kPa,Mean 11:00-15:59 vapor-pressure deficit for the moderate-density orchard
+Rg_mean_Wm2,W m-2,Daily mean shortwave radiation used by REddyProc
+Rg_max_Wm2,W m-2,Daily maximum shortwave radiation used by REddyProc
+Tair_mean_C,deg C,Daily mean air temperature used by REddyProc
+Tair_max_C,deg C,Daily maximum air temperature used by REddyProc
+Tair_min_C,deg C,Daily minimum air temperature used by REddyProc
+RH_mean_pct,percent,Daily mean relative humidity
+VPD_mean_kPa,kPa,Daily mean VPD calculated from the selected driver layer
+VPD_max_kPa,kPa,Daily maximum VPD calculated from the selected driver layer
+P_used_mm,mm day-1,Daily precipitation from the selected tower/Grant driver layer
+SWC_mean,m3 m-3,Daily mean tower soil water content
+TS_mean_C,deg C,Daily mean tower soil temperature
+n_SWC_mean,count,Mean number of valid SWC probes per half-hour
+n_TS_mean,count,Mean number of valid soil-temperature probes per half-hour
+frac_Rg_from_Grant,fraction,Fraction of daily half-hours using Grant radiation fallback
+frac_Tair_from_Grant,fraction,Fraction of daily half-hours using Grant air-temperature fallback
+frac_RH_from_Grant,fraction,Fraction of daily half-hours using Grant relative-humidity fallback

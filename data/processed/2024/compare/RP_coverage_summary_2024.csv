@@ -1,0 +1,3 @@
+site,Year,n_hh_total,n_hh_measured,n_hh_modeled,pct_hh_modeled,n_hh_GS_total,n_hh_GS_measured,n_hh_GS_modeled,pct_hh_GS_modeled
+LD,2024,17567,10406,7161,40.76393237319975,10464,6907,3557,33.9927370030581
+MD,2024,17567,15589,1978,11.259748391871122,10464,9564,900,8.600917431192661

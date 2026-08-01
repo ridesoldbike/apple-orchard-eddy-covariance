@@ -1,0 +1,3231 @@
+---
+title: "2025 Eddy-Covariance Processing Workflow"
+subtitle: "Publication version: LD and MD apple orchards"
+author: "Kevin Postma"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+if (!requireNamespace("here", quietly = TRUE)) {
+  stop("Package 'here' is required. Install it with install.packages('here').")
+}
+
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+This script reproduces the complete 2025 eddy-covariance processing workflow.
+All repository inputs use project-relative paths. Completed manual-review decision
+files are treated as permanent inputs and are never overwritten by this script.
+
+```{r process_2025}
+
+# ============================================================
+# EC Compare (LD vs MD) — 2025 10% SPIKE CLEAN REWRITE
+# ============================================================
+# Purpose:
+#   - read EddyPro full_output for LD and MD
+#   - read LD biomet and Grant envwx fallback drivers
+#   - apply dynamic NEE screening and four-stage manual review
+#   - build REddyProc input tables
+#   - run REddyProc for LD and MD
+#   - build daily / monthly outputs
+#   - estimate LD soil heat storage + energy balance closure
+#
+# Main fixes vs prior script:
+#   - build_rp_drivers() now uses bio_drivers columns: Rg, Tair, RH, P
+#   - duplicate manual rp_drivers block removed
+#   - signal_strength handled safely if missing
+#   - winter negative and winter positive review aligned with 2023/2024
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(stringr)
+  library(lubridate)
+  library(purrr)
+  library(tidyr)
+  library(ggplot2)
+  library(REddyProc)
+  library(zoo)
+  library(here)
+})
+
+# ----------------------------
+# 0) ANALYSIS SETTINGS
+# ----------------------------
+year_use <- 2025
+tz_site  <- "America/Toronto"
+run_tag  <- "10spike"
+
+# Repository root is detected from the .Rproj or .git directory.
+repo_root <- here::here()
+
+
+LatDeg       <- 42.9
+LongDeg      <- -85.1
+TimeZoneHour <- -5
+
+# LD orchard sector to KEEP
+fetch_keep_min <- 90
+fetch_keep_max <- 315
+
+# Growing season
+gs_start <- as.Date(sprintf("%d-04-15", year_use))
+gs_end   <- as.Date(sprintf("%d-10-31", year_use))
+
+# Dynamic screening settings
+night_rg_thr <- 10
+transition_rg_thr <- 50
+
+nee_max_global <- 80
+winter_neg_night_remove <- -5
+winter_pos_night_review <- 12
+ustar_review_thr <- 0.10
+
+# physically based low-NEE artifact screen
+nee_extreme_cutoff <- -120
+rg_low_cutoff      <- 100
+ustar_low_cutoff   <- 0.25
+
+# Winter cleanup before REddyProc
+winter_months <- c(11, 12, 1, 2)
+nee_winter_night_pos_cap <- 6
+
+# REddyProc settings
+sw_thr <- 10
+n_boot <- 100L
+probs  <- c(0.05, 0.50, 0.95)
+scen_use <- "U50"
+
+# Coverage / reporting
+min_coverage <- 0.70
+min_frac_Rg_daily <- 0.75
+
+# Sentinel values
+sentinel <- c(-9999, -9999.0, -6999, -7999, -8888, 6999, 7999, 9999, -19998, 19998)
+
+# Gstorage / energy balance
+z_plate_m     <- 0.05
+rho_b         <- 1300
+cp_solid      <- 800
+rho_w         <- 1000
+cp_w          <- 4186
+max_abs_Gstor <- 200
+
+# Plot colors
+okabe_ito <- c(
+  orange    = "#E69F00",
+  skyblue   = "#56B4E9",
+  green     = "#009E73",
+  yellow    = "#F0E442",
+  blue      = "#0072B2",
+  vermilion = "#D55E00",
+  purple    = "#CC79A7",
+  black     = "#000000"
+)
+
+flux_colors <- c(
+  GPP  = okabe_ito["green"],
+  Reco = okabe_ito["orange"],
+  NEE  = okabe_ito["blue"]
+)
+
+site_cols <- c(
+  LD = okabe_ito["vermilion"],
+  MD = okabe_ito["blue"]
+)
+
+# ----------------------------
+# 1) REPOSITORY INPUT / OUTPUT PATHS
+# ----------------------------
+
+# Raw 2025 files are stored under data/raw/2025.
+year_dir <- here::here("data", "raw", as.character(year_use))
+ld_dir <- file.path(year_dir, "low-density_10spike")
+md_dir <- file.path(year_dir, "moderate-density_10spike")
+grant_path <- file.path(year_dir, "envwx_2025.csv")
+
+# Completed manual-review files are version-controlled analysis inputs.
+manual_review_root <- here::here(
+  "data", "manual_review", as.character(year_use)
+)
+
+high_positive_review_dir <- file.path(
+  manual_review_root,
+  paste0("HighPositiveReview_", year_use)
+)
+
+large_negative_review_dir <- file.path(
+  manual_review_root,
+  paste0("LargeNegativeReview_", year_use)
+)
+
+winter_negative_review_dir <- file.path(
+  manual_review_root,
+  paste0("WinterNegativeReview_", year_use)
+)
+
+winter_positive_review_dir <- file.path(
+  manual_review_root,
+  paste0("WinterPositiveReview_", year_use)
+)
+
+# Generated processing outputs.
+out_dir <- here::here("data", "processed", as.character(year_use))
+manual_review_diagnostic_root <- file.path(
+  out_dir, "manual_review_diagnostics"
+)
+
+# Generated diagnostic figures. Manuscript figures will be made later by a
+# separate publication-figure script.
+diagnostic_figure_dir <- here::here(
+  "figures", "processing_diagnostics", as.character(year_use)
+)
+
+for (dd in c(
+  out_dir,
+  file.path(out_dir, "LD"),
+  file.path(out_dir, "MD"),
+  file.path(out_dir, "compare"),
+  manual_review_diagnostic_root,
+  file.path(diagnostic_figure_dir, "LD"),
+  file.path(diagnostic_figure_dir, "compare")
+)) {
+  dir.create(dd, recursive = TRUE, showWarnings = FALSE)
+}
+
+# Required completed decision files.
+manual_decision_paths <- c(
+  HighPositive = file.path(
+    high_positive_review_dir,
+    paste0("HighPositiveReview_manual_decisions_TEMPLATE_", year_use, ".csv")
+  ),
+  LargeNegative = file.path(
+    large_negative_review_dir,
+    paste0("LargeNegativeReview_manual_decisions_TEMPLATE_", year_use, ".csv")
+  ),
+  WinterNegative = file.path(
+    winter_negative_review_dir,
+    paste0("WinterNegativeReview_manual_decisions_TEMPLATE_", year_use, ".csv")
+  ),
+  WinterPositive = file.path(
+    winter_positive_review_dir,
+    paste0("WinterPositiveReview_manual_decisions_TEMPLATE_", year_use, ".csv")
+  )
+)
+
+required_dirs <- c(ld_dir, md_dir)
+missing_dirs <- required_dirs[!dir.exists(required_dirs)]
+
+if (length(missing_dirs) > 0) {
+  stop(
+    "Missing required 2025 raw-data folder(s):\n",
+    paste(missing_dirs, collapse = "\n")
+  )
+}
+
+required_files <- c(grant_path, unname(manual_decision_paths))
+missing_files <- required_files[!file.exists(required_files)]
+
+if (length(missing_files) > 0) {
+  stop(
+    "Missing required 2025 input file(s):\n",
+    paste(missing_files, collapse = "\n")
+  )
+}
+
+analysis_parameters <- tibble::tribble(
+  ~parameter, ~value,
+  "year", as.character(year_use),
+  "timezone", tz_site,
+  "run_tag", run_tag,
+  "latitude_degrees", as.character(LatDeg),
+  "longitude_degrees", as.character(LongDeg),
+  "timezone_hour", as.character(TimeZoneHour),
+  "LD_fetch_keep_min_degrees", as.character(fetch_keep_min),
+  "LD_fetch_keep_max_degrees", as.character(fetch_keep_max),
+  "growing_season_start", as.character(gs_start),
+  "growing_season_end", as.character(gs_end),
+  "night_Rg_threshold_W_m2", as.character(night_rg_thr),
+  "transition_Rg_threshold_W_m2", as.character(transition_rg_thr),
+  "global_NEE_max_umol_m2_s", as.character(nee_max_global),
+  "winter_negative_review_threshold_umol_m2_s", as.character(winter_neg_night_remove),
+  "winter_positive_review_threshold_umol_m2_s", as.character(winter_pos_night_review),
+  "uStar_review_threshold_m_s", as.character(ustar_review_thr),
+  "REddyProc_bootstrap_iterations", as.character(n_boot),
+  "REddyProc_scenario_used", scen_use,
+  "minimum_reporting_coverage", as.character(min_coverage),
+  "minimum_daily_Rg_fraction", as.character(min_frac_Rg_daily)
+)
+
+write_csv(
+  analysis_parameters,
+  file.path(out_dir, paste0("Analysis_parameters_", year_use, ".csv"))
+)
+
+# ============================================================
+# 2) HELPERS
+# ============================================================
+need_cols <- function(df, cols, label = "df") {
+  miss <- setdiff(cols, names(df))
+  if (length(miss)) stop(label, " missing: ", paste(miss, collapse = ", "))
+}
+
+norm_time <- function(tt) {
+  tt <- str_trim(as.character(tt))
+  str_replace(tt, "^([0-9]):", "0\\1:")
+}
+
+detect_delim <- function(line) {
+  if (str_count(line, fixed("\t")) > str_count(line, fixed(","))) "\t" else ","
+}
+
+coerce_numeric_and_sentinel_to_na <- function(df, keep_cols = "DateTime") {
+  df %>%
+    mutate(across(-all_of(keep_cols), ~ suppressWarnings(as.numeric(.x)))) %>%
+    mutate(across(-all_of(keep_cols), ~ ifelse(.x %in% sentinel, NA_real_, .x)))
+}
+
+collapse_duplicates <- function(df) {
+  stopifnot("DateTime" %in% names(df))
+  df %>%
+    group_by(DateTime) %>%
+    summarise(
+      across(
+        everything(),
+        ~{
+          if (cur_column() == "DateTime") {
+            first(.x)
+          } else {
+            x <- .x[!is.na(.x)]
+            if (length(x) == 0) NA else x[1]
+          }
+        }
+      ),
+      .groups = "drop"
+    ) %>%
+    arrange(DateTime)
+}
+
+full_output_files <- function(dir_path) {
+  list.files(
+    dir_path,
+    pattern = "full_output.*\\.csv$",
+    full.names = TRUE,
+    ignore.case = TRUE,
+    recursive = TRUE
+  )
+}
+
+parse_dt_date_time <- function(date_vec, time_vec, tz = tz_site) {
+  date_chr <- str_trim(as.character(date_vec))
+  time_chr <- norm_time(time_vec)
+  dt_chr   <- paste(date_chr, time_chr)
+
+  dt <- suppressWarnings(mdy_hm(dt_chr, tz = tz))
+  if (all(is.na(dt))) dt <- suppressWarnings(ymd_hm(dt_chr, tz = tz))
+  if (all(is.na(dt))) {
+    dt <- suppressWarnings(parse_date_time(
+      dt_chr,
+      orders = c("mdy HM", "mdy HMS", "ymd HM", "ymd HMS", "dmy HM", "dmy HMS"),
+      tz = tz
+    ))
+  }
+  floor_date(dt, "30 minutes")
+}
+
+# Parse manual-review timestamps without shifting Eastern local times.
+parse_review_datetime <- function(x, tz = tz_site) {
+
+  # readr may already have parsed the CSV column as POSIXct.
+  # Preserve the absolute instant and display it in local site time.
+  if (inherits(x, "POSIXt")) {
+    return(lubridate::with_tz(x, tzone = tz))
+  }
+
+  x_chr <- stringr::str_trim(as.character(x))
+
+  has_explicit_zone <- stringr::str_detect(
+    x_chr,
+    "Z$|[+-][0-9]{2}:?[0-9]{2}$"
+  )
+
+  out <- as.POSIXct(
+    rep(NA_real_, length(x_chr)),
+    origin = "1970-01-01",
+    tz = tz
+  )
+
+  # ISO values ending in Z or an offset are absolute UTC times.
+  if (any(has_explicit_zone)) {
+    parsed_utc <- suppressWarnings(
+      lubridate::ymd_hms(
+        x_chr[has_explicit_zone],
+        tz = "UTC",
+        quiet = TRUE
+      )
+    )
+
+    out[has_explicit_zone] <- lubridate::with_tz(
+      parsed_utc,
+      tzone = tz
+    )
+  }
+
+  # Values without a timezone are treated as orchard local time.
+  if (any(!has_explicit_zone)) {
+    parsed_local <- suppressWarnings(
+      lubridate::parse_date_time(
+        x_chr[!has_explicit_zone],
+        orders = c(
+          "ymd HMS", "ymd HM", "ymd",
+          "mdy HMS", "mdy HM", "mdy",
+          "dmy HMS", "dmy HM", "dmy"
+        ),
+        tz = tz
+      )
+    )
+
+    out[!has_explicit_zone] <- parsed_local
+  }
+
+  out
+}
+
+make_full_year_time <- function(year, tz = tz_site) {
+  start <- as.POSIXct(sprintf("%d-01-01 00:30:00", year), tz = tz)
+  end_excl <- as.POSIXct(sprintf("%d-01-01 00:00:00", year + 1), tz = tz)
+  tibble(DateTime = seq(from = start, to = end_excl - minutes(30), by = "30 min"))
+}
+
+K_to_C_if_needed <- function(x) {
+  x <- as.numeric(x)
+  med <- suppressWarnings(median(x, na.rm = TRUE))
+  if (is.finite(med) && med > 150) x - 273.15 else x
+}
+
+Pa_to_kPa_if_needed <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  med <- suppressWarnings(median(x, na.rm = TRUE))
+  if (is.finite(med) && med > 50) x / 1000 else x
+}
+
+calc_vpd_kPa <- function(Tair_C, RH_pct) {
+  Tair_C <- suppressWarnings(as.numeric(Tair_C))
+  RH_pct <- suppressWarnings(as.numeric(RH_pct))
+  med_rh <- suppressWarnings(median(RH_pct, na.rm = TRUE))
+  if (is.finite(med_rh) && med_rh <= 1.5) RH_pct <- RH_pct * 100
+  RH_pct[RH_pct < 0 | RH_pct > 100] <- NA_real_
+
+  es <- 0.6108 * exp((17.27 * Tair_C) / (Tair_C + 237.3))
+  ea <- es * (RH_pct / 100)
+  vpd <- es - ea
+  vpd[vpd < 0 | vpd > 8] <- NA_real_
+  vpd
+}
+
+esat_hPa <- function(Tair_C) 6.112 * exp((17.67 * Tair_C) / (Tair_C + 243.5))
+
+vpd_from_tair_rh_hPa <- function(Tair_C, RH_pct) {
+  T  <- suppressWarnings(as.numeric(Tair_C))
+  RH <- suppressWarnings(as.numeric(RH_pct))
+  out <- esat_hPa(T) * (1 - RH / 100)
+  out[!is.finite(out) | out < 0] <- NA_real_
+  out
+}
+
+safe_mean <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+safe_sum  <- function(x) if (all(is.na(x))) NA_real_ else sum(x,  na.rm = TRUE)
+safe_max  <- function(x) if (all(is.na(x))) NA_real_ else max(x,  na.rm = TRUE)
+safe_min  <- function(x) if (all(is.na(x))) NA_real_ else min(x,  na.rm = TRUE)
+
+umolco2_to_gC_hh <- function(x_umol_m2_s, seconds = 1800) {
+  x_umol_m2_s * 12e-6 * seconds
+}
+
+# ============================================================
+# 3) READERS
+# ============================================================
+read_full_output <- function(path, tz = tz_site) {
+  l2 <- read_lines(path, n_max = 2)[2]
+  delim <- detect_delim(l2)
+
+  nm <- strsplit(l2, split = delim, fixed = TRUE)[[1]]
+  nm <- make.names(nm, unique = TRUE)
+
+  df <- read_delim(
+    file = path,
+    delim = delim,
+    skip = 2,
+    col_names = FALSE,
+    show_col_types = FALSE,
+    progress = FALSE,
+    trim_ws = TRUE
+  )
+
+  df <- df[-1, , drop = FALSE]
+  names(df) <- nm
+
+  nms_low <- tolower(names(df))
+  date_col <- names(df)[match(TRUE, nms_low %in% "date")]
+  time_col <- names(df)[match(TRUE, nms_low %in% "time")]
+
+  if (is.na(date_col) || is.na(time_col)) {
+    stop("full_output missing date/time in: ", basename(path))
+  }
+
+  sig_col <- names(df)[grepl("rssi|signal.*strength", tolower(names(df)))][1]
+
+  df %>%
+    mutate(DateTime = parse_dt_date_time(.data[[date_col]], .data[[time_col]], tz = tz)) %>%
+    filter(!is.na(DateTime)) %>%
+    transmute(
+      DateTime,
+      co2_flux          = suppressWarnings(as.numeric(.data[["co2_flux"]])),
+      co2_strg          = if ("co2_strg" %in% names(df)) suppressWarnings(as.numeric(.data[["co2_strg"]])) else NA_real_,
+      qc_co2_flux       = if ("qc_co2_flux" %in% names(df)) suppressWarnings(as.numeric(.data[["qc_co2_flux"]])) else NA_real_,
+      rand_err_co2_flux = if ("rand_err_co2_flux" %in% names(df)) suppressWarnings(as.numeric(.data[["rand_err_co2_flux"]])) else NA_real_,
+      H                 = if ("H" %in% names(df)) suppressWarnings(as.numeric(.data[["H"]])) else NA_real_,
+      LE                = if ("LE" %in% names(df)) suppressWarnings(as.numeric(.data[["LE"]])) else NA_real_,
+      ustar             = if ("u." %in% names(df)) suppressWarnings(as.numeric(.data[["u."]])) else if ("Ustar" %in% names(df)) suppressWarnings(as.numeric(.data[["Ustar"]])) else NA_real_,
+      wind_dir          = if ("wind_dir" %in% names(df)) suppressWarnings(as.numeric(.data[["wind_dir"]])) else NA_real_,
+      VPD_Pa            = if ("VPD" %in% names(df)) suppressWarnings(as.numeric(.data[["VPD"]])) else NA_real_,
+      signal_strength   = if (!is.na(sig_col)) suppressWarnings(as.numeric(.data[[sig_col]])) else NA_real_
+    ) %>%
+    coerce_numeric_and_sentinel_to_na(keep_cols = "DateTime")
+}
+
+read_biomet_halfhour <- function(path, tz = tz_site) {
+  lines <- read_lines(path, n_max = 3)
+  delim <- detect_delim(lines[1])
+
+  header_vec <- strsplit(lines[1], split = delim, fixed = TRUE)[[1]] %>% str_trim()
+  nm <- make.names(header_vec, unique = TRUE)
+
+  df <- read_delim(
+    file = path,
+    delim = delim,
+    skip = 1,
+    col_names = FALSE,
+    show_col_types = FALSE,
+    progress = FALSE,
+    trim_ws = TRUE
+  )
+
+  df <- df[-1, , drop = FALSE]
+  names(df) <- nm
+
+  if (all(c("TIMESTAMP_1", "TIMESTAMP_2") %in% names(df))) {
+    dt_chr <- paste(str_trim(df$TIMESTAMP_1), str_trim(df$TIMESTAMP_2))
+    dt <- suppressWarnings(parse_date_time(
+      dt_chr,
+      orders = c("ymd HMS", "ymd HM", "mdy HMS", "mdy HM", "dmy HMS", "dmy HM"),
+      tz = tz
+    ))
+  } else {
+    nms_low <- tolower(names(df))
+    date_col <- names(df)[match(TRUE, grepl("date", nms_low))]
+    time_col <- names(df)[match(TRUE, grepl("time", nms_low))]
+    if (is.na(date_col) || is.na(time_col)) {
+      print(names(df))
+      stop("Biomet missing date/time in: ", basename(path))
+    }
+    dt <- parse_dt_date_time(df[[date_col]], df[[time_col]], tz = tz)
+  }
+
+  df %>%
+    mutate(DateTime = floor_date(dt, "30 minutes")) %>%
+    filter(!is.na(DateTime)) %>%
+    coerce_numeric_and_sentinel_to_na(keep_cols = "DateTime") %>%
+    arrange(DateTime)
+}
+
+read_envwx_grant <- function(path, tz = tz_site) {
+  lines <- read_lines(path)
+
+  hdr_idx <- which(
+    grepl("\\bdate\\b", tolower(lines)) &
+      grepl("\\btime\\b", tolower(lines)) &
+      grepl("\\batmp\\b|\\bair\\s*temp\\b|\\btemperature\\b", tolower(lines))
+  )[1]
+  if (is.na(hdr_idx)) hdr_idx <- 1
+
+  x <- read_csv(
+    path,
+    skip = hdr_idx - 1,
+    col_types = cols(.default = col_character()),
+    show_col_types = FALSE,
+    progress = FALSE
+  ) %>%
+    rename_with(~ tolower(trimws(.x))) %>%
+    select(where(~ !all(is.na(.x))))
+
+  if ("date" %in% names(x)) x <- x %>% filter(grepl("[0-9]", .data$date))
+
+  to_num <- function(v, trace_to_zero = TRUE) {
+    v <- str_trim(as.character(v))
+    v[v %in% c("", "NA", "N/A", "M", "m")] <- NA_character_
+    if (trace_to_zero) v[v %in% c("T", "t", "trace", "TRACE")] <- "0"
+    suppressWarnings(as.numeric(v))
+  }
+
+  solar_to_Wm2_if_needed_local <- function(v) {
+    v <- to_num(v, trace_to_zero = FALSE)
+    mx <- suppressWarnings(max(v, na.rm = TRUE))
+    if (is.finite(mx) && mx > 1500) v * (1000 / 3600) else v
+  }
+
+  nms <- names(x)
+  pick1 <- function(patterns) {
+    idx <- which(map_lgl(nms, ~ any(str_detect(.x, patterns))))
+    if (length(idx) == 0) NA_character_ else nms[idx[1]]
+  }
+
+  c_date <- if ("date" %in% nms) "date" else pick1(c("^date$", "day"))
+  c_time <- if ("time" %in% nms) "time" else pick1(c("^time$", "hour"))
+  c_atmp <- if ("atmp" %in% nms) "atmp" else pick1(c("atmp", "air.?temp", "temperature"))
+  c_relh <- if ("relh" %in% nms) "relh" else pick1(c("relh", "rh"))
+  c_srad <- if ("srad" %in% nms) "srad" else pick1(c("srad", "solar", "rad"))
+  c_pcpn <- if ("pcpn" %in% nms) "pcpn" else pick1(c("pcpn", "precip", "rain"))
+
+  dt_chr <- paste(str_trim(x[[c_date]]), norm_time(x[[c_time]]))
+  dt <- suppressWarnings(parse_date_time(
+    dt_chr,
+    orders = c("mdy HM", "mdy HMS", "ymd HM", "ymd HMS", "dmy HM", "dmy HMS"),
+    tz = tz
+  ))
+
+  tibble(
+    DateTime   = floor_date(dt, "hour"),
+    Tair_env_C = to_num(x[[c_atmp]], trace_to_zero = FALSE),
+    RH_env_pct = if (!is.na(c_relh)) to_num(x[[c_relh]], trace_to_zero = FALSE) else NA_real_,
+    Rg_env_Wm2 = if (!is.na(c_srad)) solar_to_Wm2_if_needed_local(x[[c_srad]]) else NA_real_,
+    pcpn_mm_hr = if (!is.na(c_pcpn)) to_num(x[[c_pcpn]], trace_to_zero = TRUE) else NA_real_
+  ) %>%
+    filter(!is.na(DateTime)) %>%
+    distinct(DateTime, .keep_all = TRUE) %>%
+    arrange(DateTime) %>%
+    mutate(VPD_env_kPa = calc_vpd_kPa(Tair_env_C, RH_env_pct))
+}
+
+make_envwx_halfhour <- function(envwx_hourly) {
+  need_cols(envwx_hourly, c("DateTime","Rg_env_Wm2","Tair_env_C","RH_env_pct","pcpn_mm_hr","VPD_env_kPa"), "envwx_hourly")
+  bind_rows(
+    envwx_hourly %>% transmute(
+      DateTime,
+      Rg_env_Wm2, Tair_env_C, RH_env_pct, VPD_env_kPa,
+      pcpn_mm_30min = pcpn_mm_hr / 2
+    ),
+    envwx_hourly %>% transmute(
+      DateTime = DateTime + minutes(30),
+      Rg_env_Wm2, Tair_env_C, RH_env_pct, VPD_env_kPa,
+      pcpn_mm_30min = pcpn_mm_hr / 2
+    )
+  ) %>%
+    arrange(DateTime) %>%
+    distinct(DateTime, .keep_all = TRUE)
+}
+
+# ============================================================
+# 4) BIOMET QC + SOIL AGGREGATION
+# ============================================================
+qc_rules <- tibble::tribble(
+  ~col,        ~rule,          ~start,                       ~end,
+  "SHF_2_1_1", "bad_after",    sprintf("%d-05-15", year_use), NA,
+  "SHF_1_1_1", "bad_after",    sprintf("%d-10-13", year_use), NA,
+  "SHF_3_1_1", "bad_all_year", NA,                            NA,
+  "TS_2_1_1",  "bad_after",    sprintf("%d-08-02", year_use), NA,
+  "SWC_1_1_1", "bad_between",  sprintf("%d-05-11", year_use), sprintf("%d-06-18", year_use)
+)
+
+apply_qc_rules <- function(df, qc_rules_tbl, tz = tz_site) {
+  rules <- qc_rules_tbl %>%
+    mutate(
+      start_dt = ifelse(is.na(start), NA_character_, paste0(start, " 00:00:00")),
+      end_dt   = ifelse(is.na(end),   NA_character_, paste0(end,   " 23:59:59")),
+      start_dt = as.POSIXct(start_dt, tz = tz),
+      end_dt   = as.POSIXct(end_dt, tz = tz)
+    )
+
+  out <- df
+  for (i in seq_len(nrow(rules))) {
+    col_i  <- rules$col[i]
+    rule_i <- rules$rule[i]
+    sdt    <- rules$start_dt[i]
+    edt    <- rules$end_dt[i]
+    if (!col_i %in% names(out)) next
+
+    if (rule_i == "bad_all_year") {
+      out[[col_i]] <- NA_real_
+    } else if (rule_i == "bad_after" && !is.na(sdt)) {
+      out[[col_i]] <- ifelse(out$DateTime >= sdt, NA_real_, out[[col_i]])
+    } else if (rule_i == "bad_before" && !is.na(sdt)) {
+      out[[col_i]] <- ifelse(out$DateTime <= sdt, NA_real_, out[[col_i]])
+    } else if (rule_i == "bad_between" && !is.na(sdt) && !is.na(edt)) {
+      out[[col_i]] <- ifelse(out$DateTime >= sdt & out$DateTime <= edt, NA_real_, out[[col_i]])
+    }
+  }
+  out
+}
+
+range_screen_biomet <- function(df) {
+  df %>%
+    mutate(
+      across(matches("^SWC_"), ~ ifelse(!is.na(.x) & (.x < 0 | .x > 0.8), NA_real_, .x)),
+      across(matches("^TS_"),  ~ ifelse(!is.na(.x) & (.x < 230 | .x > 330), NA_real_, .x)),
+      across(matches("^SHF_"), ~ ifelse(!is.na(.x) & (abs(.x) > 300), NA_real_, .x))
+    )
+}
+
+aggregate_soil_probes <- function(df) {
+  shf_cols <- grep("^SHF_", names(df), value = TRUE)
+  ts_cols  <- grep("^TS_",  names(df), value = TRUE)
+  swc_cols <- grep("^SWC_", names(df), value = TRUE)
+
+  df %>%
+    rowwise() %>%
+    mutate(
+      n_SHF = if (length(shf_cols) > 0) sum(!is.na(c_across(all_of(shf_cols)))) else NA_integer_,
+      n_TS  = if (length(ts_cols)  > 0) sum(!is.na(c_across(all_of(ts_cols))))  else NA_integer_,
+      n_SWC = if (length(swc_cols) > 0) sum(!is.na(c_across(all_of(swc_cols)))) else NA_integer_,
+      SHF = {
+        x <- if (length(shf_cols) > 0) c_across(all_of(shf_cols)) else numeric(0)
+        if (length(x) == 0 || all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+      },
+      TS = {
+        x <- if (length(ts_cols) > 0) c_across(all_of(ts_cols)) else numeric(0)
+        if (length(x) == 0 || all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+      },
+      SWC = {
+        x <- if (length(swc_cols) > 0) c_across(all_of(swc_cols)) else numeric(0)
+        if (length(x) == 0 || all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+      }
+    ) %>%
+    ungroup()
+}
+
+# ============================================================
+# 5) READ FILES
+# ============================================================
+ld_full_paths <- full_output_files(ld_dir)
+md_full_paths <- full_output_files(md_dir)
+
+stopifnot(length(ld_full_paths) > 0, length(md_full_paths) > 0)
+
+bio_candidates <- list.files(
+  ld_dir,
+  pattern = "biomet.*\\.csv$",
+  full.names = TRUE,
+  ignore.case = TRUE,
+  recursive = TRUE
+)
+bio_candidates <- bio_candidates[!grepl("biomet_daily", basename(bio_candidates), ignore.case = TRUE)]
+stopifnot(length(bio_candidates) > 0)
+
+biomet_paths <- bio_candidates
+
+input_manifest <- tibble(
+  input_role = c(
+    rep("LD EddyPro full_output", length(ld_full_paths)),
+    rep("MD EddyPro full_output", length(md_full_paths)),
+    rep("LD biomet", length(biomet_paths)),
+    "Grant environmental drivers",
+    names(manual_decision_paths)
+  ),
+  path = c(
+    ld_full_paths,
+    md_full_paths,
+    biomet_paths,
+    grant_path,
+    unname(manual_decision_paths)
+  )
+) %>%
+  mutate(
+    path = normalizePath(path, winslash = "/", mustWork = TRUE),
+    size_bytes = file.info(path)$size,
+    modified_time = as.character(file.info(path)$mtime)
+  )
+
+write_csv(
+  input_manifest,
+  file.path(out_dir, paste0("Input_manifest_", year_use, ".csv"))
+)
+
+start_dt <- as.POSIXct(sprintf("%d-01-01 00:30:00", year_use), tz = tz_site)
+end_dt   <- as.POSIXct(sprintf("%d-01-01 00:00:00", year_use + 1), tz = tz_site)
+
+ld_full <- map_dfr(ld_full_paths, read_full_output) %>%
+  collapse_duplicates() %>%
+  filter(DateTime >= start_dt, DateTime < end_dt)
+
+md_full <- map_dfr(md_full_paths, read_full_output) %>%
+  collapse_duplicates() %>%
+  filter(DateTime >= start_dt, DateTime < end_dt)
+
+bio_raw <- map_dfr(biomet_paths, read_biomet_halfhour) %>%
+  collapse_duplicates() %>%
+  filter(DateTime >= start_dt, DateTime < end_dt) %>%
+  range_screen_biomet()
+
+cat("Rows after filtering + range-screen:\n",
+    "LD full_output:", nrow(ld_full), "\n",
+    "MD full_output:", nrow(md_full), "\n",
+    "Biomet:", nrow(bio_raw), "\n\n")
+
+# ============================================================
+# 6) APPLY SOIL QC, BUILD BIO DRIVERS
+# ============================================================
+bio_keep <- bio_raw %>%
+  apply_qc_rules(qc_rules_tbl = qc_rules, tz = tz_site) %>%
+  aggregate_soil_probes() %>%
+  collapse_duplicates()
+
+write_csv(
+  bio_keep,
+  file.path(out_dir, "LD", paste0("LD_biomet_halfhour_qc_aggregated_", year_use, ".csv"))
+)
+
+bio_drivers <- bio_keep %>%
+  transmute(
+    DateTime,
+    Rg   = as.numeric(RG_1_1_1),
+    Rn   = as.numeric(RN_1_1_1),
+    Tair = as.numeric(TA_1_1_1),
+    RH   = as.numeric(RH_1_1_1),
+    P    = as.numeric(P_RAIN_1_1_1),
+    SHF, TS, SWC, n_SHF, n_TS, n_SWC,
+    RG_1_1_1 = as.numeric(RG_1_1_1),
+    RN_1_1_1 = as.numeric(RN_1_1_1)
+  ) %>%
+  coerce_numeric_and_sentinel_to_na(keep_cols = "DateTime") %>%
+  arrange(DateTime)
+stopifnot(all(c("SHF","TS","SWC","n_SHF","n_TS","n_SWC") %in% names(bio_drivers)))
+
+write_csv(
+  bio_drivers,
+  file.path(out_dir, "LD", paste0("LD_biomet_drivers_halfhour_", year_use, ".csv"))
+)
+
+bio_daily <- bio_drivers %>%
+  mutate(Date = as.Date(DateTime)) %>%
+  group_by(Date) %>%
+  summarise(
+    Rg_mean_Wm2   = safe_mean(Rg),
+    Tair_mean_C   = safe_mean(K_to_C_if_needed(Tair)),
+    RH_pct_mean   = safe_mean(RH),
+    P_sum         = safe_sum(P),
+    SHF_Wm2_mean  = safe_mean(SHF),
+    TS_C_mean     = safe_mean(K_to_C_if_needed(TS)),
+    SWC_mean      = safe_mean(SWC),
+    n_SHF_mean    = safe_mean(n_SHF),
+    n_TS_mean     = safe_mean(n_TS),
+    n_SWC_mean    = safe_mean(n_SWC),
+    .groups = "drop"
+  )
+
+write_csv(bio_daily, file.path(out_dir, "compare", paste0("Biomet_daily_", year_use, ".csv")))
+
+# ============================================================
+# 7) GRANT HALFHOUR + RP DRIVERS
+# ============================================================
+build_rp_drivers <- function(bio_drivers, grant_hh = NULL) {
+  drv <- bio_drivers %>%
+    transmute(
+      DateTime,
+      Rg_bio      = suppressWarnings(as.numeric(Rg)),
+      Tair_bio    = K_to_C_if_needed(Tair),
+      RH_bio      = suppressWarnings(as.numeric(RH)),
+      P_bio_mm_30 = suppressWarnings(as.numeric(P)) * 1000
+    )
+
+  if (!is.null(grant_hh)) {
+    drv <- drv %>%
+      left_join(
+        grant_hh %>%
+          transmute(
+            DateTime,
+            Rg_grant      = suppressWarnings(as.numeric(Rg_env_Wm2)),
+            Tair_grant    = suppressWarnings(as.numeric(Tair_env_C)),
+            RH_grant      = suppressWarnings(as.numeric(RH_env_pct)),
+            VPD_grant_kPa = suppressWarnings(as.numeric(VPD_env_kPa)),
+            P_grant_mm_30 = suppressWarnings(as.numeric(pcpn_mm_30min))
+          ),
+        by = "DateTime"
+      ) %>%
+      mutate(
+        Rg_raw = coalesce(Rg_bio, Rg_grant),
+        Rg = case_when(
+          is.na(Rg_raw) ~ NA_real_,
+          Rg_raw < 0    ~ 0,
+          Rg_raw > 1400 ~ NA_real_,
+          TRUE          ~ Rg_raw
+        ),
+        Tair = coalesce(Tair_bio, Tair_grant),
+        RH   = coalesce(RH_bio, RH_grant),
+        P_mm_30 = coalesce(P_bio_mm_30, P_grant_mm_30),
+        Rg_src   = if_else(!is.na(Rg_bio),   "biomet", if_else(!is.na(Rg_grant),   "grant", NA_character_)),
+        Tair_src = if_else(!is.na(Tair_bio), "biomet", if_else(!is.na(Tair_grant), "grant", NA_character_)),
+        RH_src   = if_else(!is.na(RH_bio),   "biomet", if_else(!is.na(RH_grant),   "grant", NA_character_)),
+        VPD_calc_kPa = calc_vpd_kPa(Tair, RH)
+      ) %>%
+      select(DateTime, Rg, Tair, RH, VPD_calc_kPa, P_mm_30,
+             Rg_src, Tair_src, RH_src, VPD_grant_kPa, Rg_raw)
+  } else {
+    drv <- drv %>%
+      mutate(
+        Rg_raw = Rg_bio,
+        Rg = case_when(
+          is.na(Rg_raw) ~ NA_real_,
+          Rg_raw < 0    ~ 0,
+          Rg_raw > 1400 ~ NA_real_,
+          TRUE          ~ Rg_raw
+        ),
+        Tair = Tair_bio,
+        RH   = RH_bio,
+        P_mm_30 = P_bio_mm_30,
+        Rg_src = "biomet",
+        Tair_src = "biomet",
+        RH_src = "biomet",
+        VPD_calc_kPa = calc_vpd_kPa(Tair, RH),
+        VPD_grant_kPa = NA_real_
+      ) %>%
+      select(DateTime, Rg, Tair, RH, VPD_calc_kPa, P_mm_30,
+             Rg_src, Tair_src, RH_src, VPD_grant_kPa, Rg_raw)
+  }
+
+  drv
+}
+
+grant_hourly   <- read_envwx_grant(grant_path, tz = tz_site)
+envwx_halfhour <- make_envwx_halfhour(grant_hourly)
+
+write_csv(envwx_halfhour, file.path(out_dir, "compare", paste0("grant_halfhour_", year_use, ".csv")))
+
+rp_drivers <- build_rp_drivers(bio_drivers, envwx_halfhour)
+
+write_csv(
+  rp_drivers,
+  file.path(out_dir, "compare", paste0("RPdrivers_biomet_primary_plus_Grant_", year_use, ".csv"))
+)
+
+# ============================================================
+# 8) USED DRIVERS TABLES (75% DAILY Rg RULE)
+# ============================================================
+need_cols(rp_drivers, c("DateTime","Rg","Tair","RH","VPD_calc_kPa","P_mm_30","Rg_src","Tair_src","RH_src"), "rp_drivers")
+
+used_drivers_hh <- rp_drivers %>%
+  left_join(
+    bio_drivers %>% select(DateTime, SWC, TS, n_SWC, n_TS),
+    by = "DateTime"
+  ) %>%
+  transmute(
+    DateTime = as.POSIXct(DateTime, tz = tz_site),
+    Date     = as.Date(DateTime - minutes(30)),
+    Rg_used_Wm2  = suppressWarnings(as.numeric(Rg)),
+    Tair_used_C  = suppressWarnings(as.numeric(Tair)),
+    RH_used_pct  = suppressWarnings(as.numeric(RH)),
+    VPD_used_kPa = suppressWarnings(as.numeric(VPD_calc_kPa)),
+    P_used_mm_30 = suppressWarnings(as.numeric(P_mm_30)),
+    Rg_src   = as.character(Rg_src),
+    Tair_src = as.character(Tair_src),
+    RH_src   = as.character(RH_src),
+    SWC      = suppressWarnings(as.numeric(.data[["SWC"]])),
+    TS       = suppressWarnings(as.numeric(.data[["TS"]])),
+    n_SWC    = suppressWarnings(as.numeric(.data[["n_SWC"]])),
+    n_TS     = suppressWarnings(as.numeric(.data[["n_TS"]])),
+    TS_C     = if_else(is.finite(TS) & TS > 150, TS - 273.15, TS)
+  )
+
+used_drivers_daily <- used_drivers_hh %>%
+  group_by(Date) %>%
+  summarise(
+    n_hh   = n(),
+    n_Rg   = sum(!is.na(Rg_used_Wm2)),
+    frac_Rg = n_Rg / n_hh,
+    Rg_mean_Wm2 = if_else(frac_Rg >= min_frac_Rg_daily, safe_mean(Rg_used_Wm2), NA_real_),
+    Rg_max_Wm2  = safe_max(Rg_used_Wm2),
+    Tair_mean_C  = safe_mean(Tair_used_C),
+    Tair_max_C   = safe_max(Tair_used_C),
+    Tair_min_C   = safe_min(Tair_used_C),
+    RH_mean_pct  = safe_mean(RH_used_pct),
+    VPD_mean_kPa = safe_mean(VPD_used_kPa),
+    VPD_max_kPa  = safe_max(VPD_used_kPa),
+    P_used_mm    = safe_sum(P_used_mm_30),
+    SWC_mean  = safe_mean(SWC),
+    TS_mean_C = safe_mean(TS_C),
+    n_SWC_mean = safe_mean(n_SWC),
+    n_TS_mean  = safe_mean(n_TS),
+    n_Rg_from_Grant   = sum(Rg_src   == "grant", na.rm = TRUE),
+    n_Tair_from_Grant = sum(Tair_src == "grant", na.rm = TRUE),
+    n_RH_from_Grant   = sum(RH_src   == "grant", na.rm = TRUE),
+    frac_Rg_from_Grant   = n_Rg_from_Grant / n_hh,
+    frac_Tair_from_Grant = n_Tair_from_Grant / n_hh,
+    frac_RH_from_Grant   = n_RH_from_Grant / n_hh,
+    .groups = "drop"
+  )
+
+write_csv(used_drivers_hh, file.path(out_dir, "compare", paste0("UsedDrivers_halfhour_", year_use, ".csv")))
+write_csv(used_drivers_daily, file.path(out_dir, "compare", paste0("UsedDrivers_daily_", year_use, ".csv")))
+
+# ============================================================
+# 9) BUILD REddyProc INPUT TABLES WITH DYNAMIC SCREENING
+# ============================================================
+build_rp_table <- function(full_df, site = "LD") {
+
+  df <- full_df %>%
+    left_join(rp_drivers, by = "DateTime") %>%
+    mutate(
+      Rg   = as.numeric(Rg),
+      Tair = as.numeric(Tair),
+      RH   = as.numeric(RH),
+
+      VPD_eddy_kPa = {
+        v <- Pa_to_kPa_if_needed(VPD_Pa)
+        v[v < 0 | v > 8] <- NA_real_
+        v
+      },
+      VPD = coalesce(VPD_eddy_kPa, VPD_calc_kPa),
+      Ustar = as.numeric(ustar),
+
+      NEE_raw = if_else(
+        !is.na(co2_strg),
+        as.numeric(co2_flux) + as.numeric(co2_strg),
+        as.numeric(co2_flux)
+      ),
+
+      Date = as.Date(DateTime),
+      GrowingSeason = Date >= gs_start & Date <= gs_end,
+      WinterWindow  = month(DateTime) %in% c(1, 2, 3, 11, 12),
+
+      is_night      = !is.na(Rg) & Rg < night_rg_thr,
+      is_transition = !is.na(Rg) & Rg >= night_rg_thr & Rg < transition_rg_thr,
+      is_daytime    = !is.na(Rg) & Rg >= 45,
+      low_ustar     = !is.na(Ustar) & Ustar < ustar_review_thr,
+
+      # The footprint-sector exclusion applies only to the LD orchard.
+      flag_fetch_excluded = if (site == "LD") {
+        !is.na(wind_dir) & (wind_dir < fetch_keep_min | wind_dir > fetch_keep_max)
+      } else {
+        FALSE
+      },
+
+      flag_bad_qc =
+        !is.na(qc_co2_flux) & qc_co2_flux >= 3,
+
+      # keep this as positive-only
+      flag_impossible =
+        !is.na(NEE_raw) & (NEE_raw > nee_max_global),
+
+      # Review every winter-night value below -5 that survives automatic
+      # screening and the earlier high-positive/large-negative reviews.
+      flag_review_winter_neg_night_all =
+        WinterWindow & is_night &
+        !is.na(NEE_raw) &
+        NEE_raw < winter_neg_night_remove,
+
+      # Low-u* winter negatives remain automatic removals, matching 2023/2024.
+      flag_remove_winter_neg_night =
+        WinterWindow & is_night & low_ustar &
+        !is.na(NEE_raw) & NEE_raw < winter_neg_night_remove,
+
+      flag_review_winter_pos_night =
+        WinterWindow & is_night & low_ustar &
+        !is.na(NEE_raw) & NEE_raw > winter_pos_night_review,
+
+      flag_review_winter_transition =
+        WinterWindow & is_transition &
+        !is.na(NEE_raw) & abs(NEE_raw) > 20,
+
+      flag_review_signal =
+        !is.na(signal_strength) & signal_strength < 50,
+
+      # High positive nighttime values were reviewed manually rather than
+      # automatically removed in the final 2025 workflow.
+      flag_review_high_night =
+        is_night & !is.na(NEE_raw) & NEE_raw > 50,
+
+      flag_extreme_negative =
+        !is.na(NEE_raw) &
+        NEE_raw < nee_extreme_cutoff &
+        (Rg < rg_low_cutoff | Ustar < ustar_low_cutoff),
+
+      # Final negative-artifact rules recovered from the preserved 2025
+      # REddyProc inputs and the confirmed 2024 workflow.
+      NEE_lag  = lag(NEE_raw),
+      NEE_lead = lead(NEE_raw),
+
+      is_isolated_negative_spike =
+        !is.na(NEE_raw) &
+        !is.na(NEE_lag) &
+        !is.na(NEE_lead) &
+        NEE_raw < -40 &
+        abs(NEE_raw - NEE_lag) > 20 &
+        abs(NEE_raw - NEE_lead) > 20,
+
+      flag_remove_large_negative =
+        !is.na(NEE_raw) &
+        NEE_raw < -60,
+
+      flag_remove_negative_spike =
+        !is.na(NEE_raw) &
+        NEE_raw < -40 &
+        is_isolated_negative_spike,
+
+      flag_remove_lowlight_lowustar_negative =
+        !is.na(NEE_raw) &
+        !is.na(Rg) & Rg < 10 &
+        !is.na(Ustar) & Ustar < 0.10 &
+        NEE_raw < -30,
+
+      flag_remove_negative_final =
+        flag_remove_large_negative |
+        flag_remove_negative_spike |
+        flag_remove_lowlight_lowustar_negative,
+
+      remove_nee =
+        flag_fetch_excluded |
+        flag_bad_qc |
+        flag_impossible |
+        flag_remove_winter_neg_night |
+        flag_extreme_negative |
+        flag_remove_negative_final,
+
+      NEE = if_else(remove_nee, NA_real_, NEE_raw),
+
+      # diagnostic copy of values that actually survive screening
+      NEE_kept_for_diag = if_else(remove_nee, NA_real_, NEE_raw)
+    ) %>%
+    select(
+      DateTime, NEE_raw, NEE, NEE_kept_for_diag,
+      Rg, Tair, VPD, Ustar, wind_dir, signal_strength,
+      qc_co2_flux,
+      GrowingSeason, WinterWindow, is_night, is_transition, is_daytime, low_ustar,
+      flag_fetch_excluded, flag_bad_qc, flag_impossible,
+      flag_review_winter_neg_night_all,
+      flag_remove_winter_neg_night, flag_review_winter_pos_night,
+      flag_review_winter_transition, flag_review_signal,
+      flag_review_high_night, flag_extreme_negative,
+      NEE_lag, NEE_lead, is_isolated_negative_spike,
+      flag_remove_large_negative, flag_remove_negative_spike,
+      flag_remove_lowlight_lowustar_negative, flag_remove_negative_final,
+      remove_nee
+    ) %>%
+    mutate(
+      across(c(NEE_raw, NEE, NEE_kept_for_diag, Rg, Tair, VPD, Ustar),
+             ~ if_else(.x %in% sentinel, NA_real_, .x)),
+      Rg = if_else(!is.na(Rg) & Rg < 0, 0, Rg)
+    ) %>%
+    arrange(DateTime)
+
+  make_full_year_time(year_use, tz_site) %>%
+    left_join(df, by = "DateTime") %>%
+    arrange(DateTime) %>%
+    mutate(
+      Year = year(DateTime),
+      DoY  = yday(DateTime),
+      Hour = hour(DateTime) + minute(DateTime) / 60
+    )
+}
+
+# Build automatically screened tables first.
+ld_rp <- build_rp_table(ld_full, "LD")
+md_rp <- build_rp_table(md_full, "MD")
+
+# ============================================================
+# 9C) APPLY COMPLETED HIGH-POSITIVE + LARGE-NEGATIVE DECISIONS
+# ============================================================
+# These decisions are read from data/manual_review/2025 and are never altered.
+standardize_review_file <- function(path, label) {
+  if (!file.exists(path)) {
+    stop("Missing completed ", label, " manual-decision file: ", path)
+  }
+
+  raw <- read_csv(path, show_col_types = FALSE)
+  need_cols(raw, c("site", "DateTime", "decision", "reason"), label)
+
+  raw <- raw %>%
+    mutate(
+      site = toupper(trimws(as.character(site))),
+      decision = tolower(trimws(coalesce(as.character(decision), ""))),
+      DateTime = parse_review_datetime(DateTime)
+    )
+
+  invalid <- raw %>%
+    filter(
+      !site %in% c("LD", "MD") |
+        is.na(DateTime) |
+        !decision %in% c("keep", "remove")
+    )
+
+  if (nrow(invalid) > 0) {
+    stop(
+      label, " contains ", nrow(invalid),
+      " invalid or unfinished rows. Site must be LD/MD and decision must be keep/remove."
+    )
+  }
+
+  duplicate_keys <- raw %>%
+    count(site, DateTime, name = "n") %>%
+    filter(n > 1)
+
+  if (nrow(duplicate_keys) > 0) {
+    stop("Duplicate site + DateTime keys found in ", label, ".")
+  }
+
+  raw
+}
+
+apply_manual_decisions <- function(rp_tbl, site_id, review_dir, neg_review_dir) {
+  pos_path <- file.path(
+    review_dir,
+    paste0("HighPositiveReview_manual_decisions_TEMPLATE_", year_use, ".csv")
+  )
+
+  neg_path <- file.path(
+    neg_review_dir,
+    paste0("LargeNegativeReview_manual_decisions_TEMPLATE_", year_use, ".csv")
+  )
+
+  pos_decisions <- standardize_review_file(
+    pos_path,
+    "positive manual decisions"
+  ) %>%
+    filter(site == site_id) %>%
+    transmute(
+      DateTime,
+      manual_decision_pos = decision,
+      manual_reason_pos = reason,
+      manual_remove_pos = decision == "remove"
+    )
+
+  neg_decisions <- standardize_review_file(
+    neg_path,
+    "negative manual decisions"
+  ) %>%
+    filter(site == site_id) %>%
+    transmute(
+      DateTime,
+      manual_decision_neg = decision,
+      manual_reason_neg = reason,
+      manual_remove_neg = decision == "remove"
+    )
+
+  rp_tbl %>%
+    left_join(pos_decisions, by = "DateTime") %>%
+    left_join(neg_decisions, by = "DateTime") %>%
+    mutate(
+      remove_nee_auto = remove_nee,
+
+      # Completed manual decisions override automatic screening.
+      remove_nee_final = coalesce(
+        manual_remove_neg,
+        manual_remove_pos,
+        remove_nee_auto
+      ),
+
+      NEE = if_else(remove_nee_final, NA_real_, NEE_raw),
+      NEE_kept_for_diag = if_else(remove_nee_final, NA_real_, NEE_raw)
+    )
+}
+
+review_dir <- high_positive_review_dir
+neg_review_dir <- large_negative_review_dir
+
+ld_rp <- apply_manual_decisions(ld_rp, "LD", review_dir, neg_review_dir)
+md_rp <- apply_manual_decisions(md_rp, "MD", review_dir, neg_review_dir)
+
+required_final_cols <- c(
+  "remove_nee_auto",
+  "remove_nee_final",
+  "manual_decision_pos",
+  "manual_decision_neg",
+  "flag_review_winter_neg_night_all"
+)
+
+for (site_name in c("LD", "MD")) {
+  site_tbl <- if (site_name == "LD") ld_rp else md_rp
+  missing_final_cols <- setdiff(required_final_cols, names(site_tbl))
+
+  if (length(missing_final_cols) > 0) {
+    stop(
+      site_name, " rp table is missing required columns: ",
+      paste(missing_final_cols, collapse = ", ")
+    )
+  }
+
+  if (!inherits(site_tbl$DateTime, "POSIXct")) {
+    stop(site_name, " DateTime is not POSIXct after manual-review joins.")
+  }
+}
+
+# ============================================================
+# 9C-2) RECREATE WINTER CANDIDATES AND DIAGNOSTIC FILES
+# ============================================================
+# Completed decisions remain in data/manual_review/2025.
+# Recreated candidate lists and context plots are written to processed outputs.
+winter_negative_diagnostic_dir <- file.path(
+  manual_review_diagnostic_root,
+  paste0("WinterNegativeReview_", year_use)
+)
+
+winter_positive_diagnostic_dir <- file.path(
+  manual_review_diagnostic_root,
+  paste0("WinterPositiveReview_", year_use)
+)
+
+dir.create(
+  winter_negative_diagnostic_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  winter_positive_diagnostic_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+rp_review_all <- bind_rows(
+  ld_rp %>% mutate(site = "LD"),
+  md_rp %>% mutate(site = "MD")
+)
+
+# Review winter-night NEE < -5 that survived all automatic and prior manual screens.
+winter_negative_candidates <- rp_review_all %>%
+  filter(
+    coalesce(flag_review_winter_neg_night_all, FALSE),
+    !coalesce(remove_nee_final, FALSE)
+  ) %>%
+  select(
+    site, DateTime, NEE_raw, NEE_lag, NEE_lead,
+    Rg, Tair, Ustar, low_ustar, qc_co2_flux,
+    signal_strength, wind_dir, remove_nee_auto,
+    manual_decision_neg, manual_reason_neg
+  ) %>%
+  arrange(site, DateTime)
+
+# Match 2023/2024: review every retained winter-night NEE > 12,
+# not only low-u* values.
+winter_positive_candidates <- rp_review_all %>%
+  filter(
+    coalesce(WinterWindow, FALSE),
+    coalesce(is_night, FALSE),
+    !is.na(NEE_raw),
+    NEE_raw > winter_pos_night_review,
+    !coalesce(remove_nee_final, FALSE)
+  ) %>%
+  select(
+    site, DateTime, NEE_raw, NEE_lag, NEE_lead,
+    Rg, Tair, Ustar, low_ustar, qc_co2_flux,
+    signal_strength, wind_dir, remove_nee_auto,
+    manual_decision_pos, manual_reason_pos
+  ) %>%
+  arrange(site, DateTime)
+
+winter_negative_events_path <- file.path(
+  winter_negative_diagnostic_dir,
+  paste0("WinterNegativeReview_events_", year_use, ".csv")
+)
+
+winter_negative_template_path <- file.path(
+  winter_negative_review_dir,
+  paste0("WinterNegativeReview_manual_decisions_TEMPLATE_", year_use, ".csv")
+)
+
+winter_positive_events_path <- file.path(
+  winter_positive_diagnostic_dir,
+  paste0("WinterPositiveReview_events_", year_use, ".csv")
+)
+
+winter_positive_template_path <- file.path(
+  winter_positive_review_dir,
+  paste0("WinterPositiveReview_manual_decisions_TEMPLATE_", year_use, ".csv")
+)
+
+write_csv(winter_negative_candidates, winter_negative_events_path)
+write_csv(winter_positive_candidates, winter_positive_events_path)
+
+# The completed GitHub decision files are required inputs. Do not create,
+# replace, or edit them during a publication-processing run.
+if (!file.exists(winter_negative_template_path)) {
+  stop("Missing completed winter-negative decision file: ", winter_negative_template_path)
+}
+
+if (!file.exists(winter_positive_template_path)) {
+  stop("Missing completed winter-positive decision file: ", winter_positive_template_path)
+}
+
+cat(
+  "\nWinter negative candidates:", nrow(winter_negative_candidates),
+  "\nWinter positive candidates:", nrow(winter_positive_candidates),
+  "\nNegative template:", winter_negative_template_path,
+  "\nPositive template:", winter_positive_template_path,
+  "\n"
+)
+
+# ============================================================
+# 9C-2A) CREATE MULTIPANEL CONTEXT PLOTS
+# ============================================================
+# Each PDF page shows a 6-hour window (3 hours before and after)
+# for NEE, radiation, u*, signal strength, QC, wind direction,
+# and air temperature. Pages follow the candidate-table order.
+
+make_winter_review_context_pdf <- function(
+  candidates,
+  rp_all,
+  output_pdf,
+  plot_index_path,
+  review_label,
+  review_threshold
+) {
+
+  candidates_indexed <- candidates %>%
+    arrange(site, DateTime) %>%
+    mutate(
+      plot_page = row_number(),
+      event_id = paste(
+        site,
+        review_label,
+        format(DateTime, "%Y%m%d_%H%M", tz = tz_site),
+        sep = "_"
+      )
+    )
+
+  write_csv(
+    candidates_indexed %>%
+      select(
+        plot_page, event_id, site, DateTime,
+        NEE_raw, NEE_lag, NEE_lead,
+        Rg, Tair, Ustar, qc_co2_flux,
+        signal_strength, wind_dir
+      ),
+    plot_index_path
+  )
+
+  if (nrow(candidates_indexed) == 0) {
+    message("No ", review_label, " candidates; no context PDF generated.")
+    return(invisible(candidates_indexed))
+  }
+
+  grDevices::pdf(
+    output_pdf,
+    width = 11,
+    height = 8.5,
+    onefile = TRUE
+  )
+
+  on.exit(grDevices::dev.off(), add = TRUE)
+
+  metric_levels <- c(
+    "NEE_raw", "Rg", "Ustar",
+    "signal_strength", "qc_co2_flux",
+    "wind_dir", "Tair"
+  )
+
+  metric_labels <- c(
+    NEE_raw = "NEE_raw",
+    Rg = "Rg",
+    Ustar = "Ustar",
+    signal_strength = "signal_strength",
+    qc_co2_flux = "qc_co2_flux",
+    wind_dir = "wind_dir",
+    Tair = "Tair"
+  )
+
+  for (i in seq_len(nrow(candidates_indexed))) {
+
+    event_row <- candidates_indexed[i, ]
+    this_site <- event_row$site
+    this_time <- event_row$DateTime
+
+    event_window <- rp_all %>%
+      filter(
+        site == this_site,
+        DateTime >= this_time - hours(3),
+        DateTime <= this_time + hours(3)
+      ) %>%
+      select(
+        site, DateTime,
+        NEE_raw, Rg, Ustar,
+        signal_strength, qc_co2_flux,
+        wind_dir, Tair
+      ) %>%
+      pivot_longer(
+        cols = all_of(metric_levels),
+        names_to = "metric",
+        values_to = "value"
+      ) %>%
+      mutate(
+        metric = factor(
+          metric,
+          levels = metric_levels,
+          labels = unname(metric_labels[metric_levels])
+        ),
+        is_candidate = DateTime == this_time
+      )
+
+    nee_guides <- tibble(
+      metric = factor(
+        c("NEE_raw", "NEE_raw"),
+        levels = unname(metric_labels[metric_levels])
+      ),
+      yintercept = c(0, review_threshold),
+      line_type = c("zero", "review threshold")
+    )
+
+    p <- ggplot(
+      event_window,
+      aes(x = DateTime, y = value)
+    ) +
+      geom_hline(
+        data = nee_guides,
+        aes(yintercept = yintercept, linetype = line_type),
+        inherit.aes = FALSE,
+        linewidth = 0.35
+      ) +
+      geom_line(na.rm = TRUE, linewidth = 0.45) +
+      geom_point(na.rm = TRUE, size = 1.2) +
+      geom_vline(
+        xintercept = as.numeric(this_time),
+        linewidth = 0.55
+      ) +
+      geom_point(
+        data = event_window %>% filter(is_candidate),
+        size = 3,
+        na.rm = TRUE
+      ) +
+      facet_wrap(
+        ~metric,
+        ncol = 3,
+        scales = "free_y"
+      ) +
+      scale_x_datetime(
+        date_labels = "%b %d\n%I:%M %p",
+        timezone = tz_site
+      ) +
+      scale_linetype_manual(
+        values = c("zero" = 2, "review threshold" = 3),
+        guide = "none"
+      ) +
+      labs(
+        title = paste0(
+          gsub("_", " ", review_label),
+          " — candidate ",
+          i,
+          " of ",
+          nrow(candidates_indexed),
+          " (",
+          this_site,
+          ")"
+        ),
+        subtitle = paste0(
+          "Candidate: ",
+          format(
+            this_time,
+            "%Y-%m-%d %I:%M %p %Z",
+            tz = tz_site
+          ),
+          " | NEE = ",
+          round(event_row$NEE_raw, 2),
+          " | previous = ",
+          round(event_row$NEE_lag, 2),
+          " | next = ",
+          round(event_row$NEE_lead, 2)
+        ),
+        caption = paste0(
+          "Eastern local time — ",
+          tz_site,
+          " | 3 hours before and after candidate"
+        ),
+        x = NULL,
+        y = NULL
+      ) +
+      theme_bw(base_size = 10) +
+      theme(
+        strip.text = element_text(face = "bold"),
+        axis.text.x = element_text(size = 7),
+        plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0)
+      )
+
+    print(p)
+  }
+
+  invisible(candidates_indexed)
+}
+
+winter_negative_context_pdf <- file.path(
+  winter_negative_diagnostic_dir,
+  paste0(
+    "WinterNegativeReview_context_plots_",
+    year_use,
+    "_Eastern.pdf"
+  )
+)
+
+winter_negative_plot_index_path <- file.path(
+  winter_negative_diagnostic_dir,
+  paste0(
+    "WinterNegativeReview_plot_index_",
+    year_use,
+    ".csv"
+  )
+)
+
+winter_positive_context_pdf <- file.path(
+  winter_positive_diagnostic_dir,
+  paste0(
+    "WinterPositiveReview_context_plots_",
+    year_use,
+    "_Eastern.pdf"
+  )
+)
+
+winter_positive_plot_index_path <- file.path(
+  winter_positive_diagnostic_dir,
+  paste0(
+    "WinterPositiveReview_plot_index_",
+    year_use,
+    ".csv"
+  )
+)
+
+winter_negative_candidates_indexed <- make_winter_review_context_pdf(
+  candidates = winter_negative_candidates,
+  rp_all = rp_review_all,
+  output_pdf = winter_negative_context_pdf,
+  plot_index_path = winter_negative_plot_index_path,
+  review_label = "Winter_negative_nighttime_NEE",
+  review_threshold = winter_neg_night_remove
+)
+
+winter_positive_candidates_indexed <- make_winter_review_context_pdf(
+  candidates = winter_positive_candidates,
+  rp_all = rp_review_all,
+  output_pdf = winter_positive_context_pdf,
+  plot_index_path = winter_positive_plot_index_path,
+  review_label = "Winter_positive_nighttime_NEE",
+  review_threshold = winter_pos_night_review
+)
+
+cat(
+  "\nWinter-negative context PDF:\n",
+  winter_negative_context_pdf,
+  "\n\nWinter-positive context PDF:\n",
+  winter_positive_context_pdf,
+  "\n"
+)
+
+# ============================================================
+# 9C-3) APPLY COMPLETED WINTER MANUAL DECISIONS
+# ============================================================
+# The completed decision files are permanent repository inputs. The checks
+# below confirm that they still correspond exactly to the regenerated candidates.
+
+winter_neg_raw <- standardize_review_file(
+  winter_negative_template_path,
+  "winter negative manual decisions"
+)
+
+winter_pos_raw <- standardize_review_file(
+  winter_positive_template_path,
+  "winter positive manual decisions"
+)
+
+# Ensure completed templates still match the current candidate sets.
+check_candidate_keys <- function(candidates, decisions, label) {
+  candidate_keys <- candidates %>% select(site, DateTime) %>% distinct()
+  decision_keys <- decisions %>% select(site, DateTime) %>% distinct()
+
+  missing_decisions <- anti_join(candidate_keys, decision_keys, by = c("site", "DateTime"))
+  extra_decisions <- anti_join(decision_keys, candidate_keys, by = c("site", "DateTime"))
+
+  if (nrow(missing_decisions) > 0 || nrow(extra_decisions) > 0) {
+    stop(
+      label, " template does not match the current candidate list. ",
+      "Missing decisions: ", nrow(missing_decisions),
+      "; extra decisions: ", nrow(extra_decisions), "."
+    )
+  }
+}
+
+check_candidate_keys(
+  winter_negative_candidates,
+  winter_neg_raw,
+  "Winter negative"
+)
+
+check_candidate_keys(
+  winter_positive_candidates,
+  winter_pos_raw,
+  "Winter positive"
+)
+
+winter_neg_decisions <- winter_neg_raw %>%
+  transmute(
+    site,
+    DateTime,
+    winter_decision_neg = decision,
+    winter_reason_neg = reason,
+    winter_remove_neg = decision == "remove"
+  )
+
+winter_pos_decisions <- winter_pos_raw %>%
+  transmute(
+    site,
+    DateTime,
+    winter_decision_pos = decision,
+    winter_reason_pos = reason,
+    winter_remove_pos = decision == "remove"
+  )
+
+apply_winter_decisions <- function(rp_tbl, site_id) {
+  neg_site <- winter_neg_decisions %>%
+    filter(site == site_id) %>%
+    select(-site)
+
+  pos_site <- winter_pos_decisions %>%
+    filter(site == site_id) %>%
+    select(-site)
+
+  rp_tbl %>%
+    left_join(neg_site, by = "DateTime") %>%
+    left_join(pos_site, by = "DateTime") %>%
+    mutate(
+      remove_nee_final = coalesce(
+        winter_remove_neg,
+        winter_remove_pos,
+        remove_nee_final
+      ),
+      NEE = if_else(remove_nee_final, NA_real_, NEE_raw),
+      NEE_kept_for_diag = if_else(remove_nee_final, NA_real_, NEE_raw)
+    )
+}
+
+ld_rp <- apply_winter_decisions(ld_rp, "LD")
+md_rp <- apply_winter_decisions(md_rp, "MD")
+
+winter_manual_summary <- bind_rows(
+  winter_neg_decisions %>%
+    transmute(site, review = "Winter negative", remove = winter_remove_neg),
+  winter_pos_decisions %>%
+    transmute(site, review = "Winter positive", remove = winter_remove_pos)
+) %>%
+  group_by(site, review) %>%
+  summarise(
+    n_candidates = n(),
+    n_remove = sum(remove, na.rm = TRUE),
+    n_keep = sum(!remove, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  complete(
+    site = c("LD", "MD"),
+    review = c("Winter negative", "Winter positive"),
+    fill = list(n_candidates = 0L, n_remove = 0L, n_keep = 0L)
+  ) %>%
+  arrange(site, review)
+
+print(winter_manual_summary, n = Inf)
+
+write_csv(
+  winter_manual_summary,
+  file.path(out_dir, "compare", paste0("WinterManualReview_effect_summary_", year_use, ".csv"))
+)
+
+# Save FINAL input tables only after all four manual-review stages are applied.
+write_csv(ld_rp, file.path(out_dir, "LD", paste0("LD_rp_input_FINAL_", year_use, ".csv")))
+write_csv(md_rp, file.path(out_dir, "MD", paste0("MD_rp_input_FINAL_", year_use, ".csv")))
+
+# ============================================================
+# 9D) MANUAL REVIEW IMPACT CHECK
+# ============================================================
+manual_effect_summary <- bind_rows(
+  ld_rp %>% mutate(site = "LD"),
+  md_rp %>% mutate(site = "MD")
+) %>%
+  group_by(site) %>%
+  summarise(
+    n_hh_total = n(),
+    n_auto_removed = sum(remove_nee_auto, na.rm = TRUE),
+    n_final_removed = sum(remove_nee_final, na.rm = TRUE),
+    n_manual_pos_remove = sum(manual_decision_pos == "remove", na.rm = TRUE),
+    n_manual_neg_remove = sum(manual_decision_neg == "remove", na.rm = TRUE),
+    n_manual_pos_keep = sum(manual_decision_pos == "keep", na.rm = TRUE),
+    n_manual_neg_keep = sum(manual_decision_neg == "keep", na.rm = TRUE),
+    n_winter_pos_remove = sum(winter_decision_pos == "remove", na.rm = TRUE),
+    n_winter_neg_remove = sum(winter_decision_neg == "remove", na.rm = TRUE),
+    n_winter_pos_keep = sum(winter_decision_pos == "keep", na.rm = TRUE),
+    n_winter_neg_keep = sum(winter_decision_neg == "keep", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(manual_effect_summary, n = Inf)
+
+write_csv(
+  manual_effect_summary,
+  file.path(out_dir, "compare", paste0("ManualReview_effect_summary_", year_use, ".csv"))
+)
+
+rp_counts <- bind_rows(
+  ld_rp %>% transmute(site = "LD", DateTime, rp_nonmissing = !is.na(NEE)),
+  md_rp %>% transmute(site = "MD", DateTime, rp_nonmissing = !is.na(NEE))
+) %>%
+  mutate(Date = as.Date(DateTime)) %>%
+  group_by(site, Date) %>%
+  summarise(
+    n_hh_rp_nonmissing = sum(rp_nonmissing, na.rm = TRUE),
+    n_hh_rp_gap        = sum(!rp_nonmissing, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(
+  rp_counts,
+  file.path(out_dir, "compare", paste0("RP_data_availability_", year_use, ".csv"))
+)
+
+screen_flags_daily <- bind_rows(
+  ld_rp %>% mutate(site = "LD"),
+  md_rp %>% mutate(site = "MD")
+) %>%
+  mutate(Date = as.Date(DateTime)) %>%
+  group_by(site, Date) %>%
+  summarise(
+    n_flag_bad_qc = sum(flag_bad_qc, na.rm = TRUE),
+    n_flag_impossible = sum(flag_impossible, na.rm = TRUE),
+    n_flag_fetch_excluded = sum(flag_fetch_excluded, na.rm = TRUE),
+    n_flag_extreme_negative = sum(flag_extreme_negative, na.rm = TRUE),
+    n_flag_remove_large_negative = sum(flag_remove_large_negative, na.rm = TRUE),
+    n_flag_remove_negative_spike = sum(flag_remove_negative_spike, na.rm = TRUE),
+    n_flag_remove_lowlight_lowustar_negative =
+      sum(flag_remove_lowlight_lowustar_negative, na.rm = TRUE),
+    n_flag_remove_negative_final = sum(flag_remove_negative_final, na.rm = TRUE),
+    n_flag_review_winter_neg_night_all =
+      sum(flag_review_winter_neg_night_all, na.rm = TRUE),
+    n_flag_remove_winter_neg_night = sum(flag_remove_winter_neg_night, na.rm = TRUE),
+    n_flag_review_winter_pos_night = sum(flag_review_winter_pos_night, na.rm = TRUE),
+    n_flag_review_winter_transition = sum(flag_review_winter_transition, na.rm = TRUE),
+    n_flag_review_signal = sum(flag_review_signal, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(
+  screen_flags_daily,
+  file.path(out_dir, "compare", paste0("ScreeningFlags_daily_", year_use, ".csv"))
+)
+
+# ============================================================
+# 10) RUN REddyProc
+# ============================================================
+run_reddyproc_site <- function(rp_tbl, site_id, out_subdir) {
+
+  proc_in <- rp_tbl %>%
+    transmute(
+      DateTime,
+      Year,
+      DoY,
+      Hour,
+      NEE   = as.numeric(NEE),
+      Rg    = as.numeric(Rg),
+      Tair  = as.numeric(Tair),
+      VPD   = as.numeric(VPD),
+      Ustar = as.numeric(Ustar)
+    )
+
+  EProc <- sEddyProc$new(
+    site_id,
+    proc_in,
+    c("NEE", "Rg", "Tair", "VPD", "Ustar"),
+    DTS = 48
+  )
+
+EProc$sSetLocationInfo(
+  LatDeg = LatDeg,
+  LongDeg = LongDeg,
+  TimeZoneHour = TimeZoneHour
+)
+
+# Fix the bootstrap sequence so publication results are reproducible.
+site_seed <- c(
+  LD = 202501L,
+  MD = 202502L
+)
+
+set.seed(site_seed[[site_id]])
+
+EProc$sEstimateUstarScenarios(
+  nSample = n_boot,
+  probs = probs
+)
+
+EProc$sMDSGapFillUStarScens(
+  "NEE",
+  FillAll = FALSE
+)
+
+EProc$sMDSGapFill("Tair")
+
+EProc$sMRFluxPartitionUStarScens()
+
+  export <- EProc$sExportResults()
+
+  write_csv(
+    as_tibble(export),
+    file.path(out_subdir, paste0(site_id, "_REddyProc_export_", year_use, ".csv"))
+  )
+
+  list(EProc = EProc, export = as_tibble(export))
+}
+
+ld_run <- run_reddyproc_site(ld_rp, "LD", file.path(out_dir, "LD"))
+md_run <- run_reddyproc_site(md_rp, "MD", file.path(out_dir, "MD"))
+
+# ============================================================
+# 11) EXTRACT SCENARIO OUTPUTS
+# ============================================================
+pick_scen_col <- function(nm_vec, prefix, scen = scen_use) {
+  out <- nm_vec[grepl(paste0("^", prefix, ".*", scen, "$"), nm_vec)]
+  if (length(out) == 0) out <- nm_vec[grepl(paste0("^", prefix), nm_vec)]
+  if (length(out) == 0) NA_character_ else out[1]
+}
+
+extract_fluxes <- function(export_tbl, rp_tbl, site, scen = scen_use) {
+
+  nee_col  <- paste0("NEE_",  scen, "_f")
+  gpp_col  <- paste0("GPP_",  scen, "_f")
+  reco_col <- paste0("Reco_", scen)
+
+  needed <- c(nee_col, gpp_col, reco_col)
+  miss <- setdiff(needed, names(export_tbl))
+  if (length(miss) > 0) {
+    stop("Missing expected export columns for ", site, ": ",
+         paste(miss, collapse = ", "))
+  }
+
+  cat("\n", site, " selected columns:\n", sep = "")
+  cat("NEE : ", nee_col, "\n", sep = "")
+  cat("GPP : ", gpp_col, "\n", sep = "")
+  cat("Reco: ", reco_col, "\n", sep = "")
+
+  export_tbl %>%
+    mutate(DateTime = rp_tbl$DateTime) %>%
+    transmute(
+      site = site,
+      DateTime,
+      Date = as.Date(DateTime),
+      NEE_umol  = suppressWarnings(as.numeric(.data[[nee_col]])),
+      GPP_umol  = suppressWarnings(as.numeric(.data[[gpp_col]])),
+      Reco_umol = suppressWarnings(as.numeric(.data[[reco_col]]))
+    ) %>%
+    mutate(
+      NEE_gC_hh  = umolco2_to_gC_hh(NEE_umol),
+      GPP_gC_hh  = umolco2_to_gC_hh(GPP_umol),
+      Reco_gC_hh = umolco2_to_gC_hh(Reco_umol)
+    )
+}
+ld_flux_hh <- extract_fluxes(ld_run$export, ld_rp, "LD")
+md_flux_hh <- extract_fluxes(md_run$export, md_rp, "MD")
+
+flux_hh <- bind_rows(ld_flux_hh, md_flux_hh)
+
+write_csv(flux_hh, file.path(out_dir, "compare", paste0("Flux_halfhour_", year_use, "_", scen_use, ".csv")))
+
+# ============================================================
+# 12) DAILY FLUXES
+# ============================================================
+daily_flux <- flux_hh %>%
+  group_by(site, Date) %>%
+  summarise(
+    n_obs_NEE  = sum(!is.na(NEE_gC_hh)),
+    n_obs_GPP  = sum(!is.na(GPP_gC_hh)),
+    n_obs_Reco = sum(!is.na(Reco_gC_hh)),
+    NEE_gC_day  = safe_sum(NEE_gC_hh),
+    GPP_gC_day  = safe_sum(GPP_gC_hh),
+    Reco_gC_day = safe_sum(Reco_gC_hh),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    cov_NEE  = n_obs_NEE / 48,
+    cov_GPP  = n_obs_GPP / 48,
+    cov_Reco = n_obs_Reco / 48,
+    NEE_gC_day  = if_else(cov_NEE  < min_coverage, NA_real_, NEE_gC_day),
+    GPP_gC_day  = if_else(cov_GPP  < min_coverage, NA_real_, GPP_gC_day),
+    Reco_gC_day = if_else(cov_Reco < min_coverage, NA_real_, Reco_gC_day)
+  )
+
+write_csv(daily_flux, file.path(out_dir, "compare", paste0("Daily_flux_", year_use, "_", scen_use, ".csv")))
+
+daily_flux_wide <- daily_flux %>%
+  select(site, Date, NEE_gC_day, GPP_gC_day, Reco_gC_day) %>%
+  pivot_wider(
+    names_from = site,
+    values_from = c(NEE_gC_day, GPP_gC_day, Reco_gC_day),
+    names_glue = "{site}_{.value}"
+  )
+
+# ============================================================
+# 13) DAILY VPD / DRIVERS MASTER
+# ============================================================
+site_vpd_hh <- bind_rows(
+  ld_full %>%
+    transmute(
+      site = "LD",
+      DateTime,
+      VPD_site_kPa = Pa_to_kPa_if_needed(VPD_Pa),
+      RHpct = NA_real_,
+      TA_C  = NA_real_,
+      Rg_bio = NA_real_
+    ),
+  md_full %>%
+    transmute(
+      site = "MD",
+      DateTime,
+      VPD_site_kPa = Pa_to_kPa_if_needed(VPD_Pa),
+      RHpct = NA_real_,
+      TA_C  = NA_real_,
+      Rg_bio = NA_real_
+    )
+) %>%
+  left_join(
+    bio_drivers %>%
+      transmute(
+        DateTime,
+        TA_C  = K_to_C_if_needed(Tair),
+        RHpct = as.numeric(RH),
+        Rg_bio = as.numeric(Rg)
+      ),
+    by = "DateTime",
+    suffix = c("", ".bio")
+  ) %>%
+  mutate(
+    VPD_fallback_kPa = vpd_from_tair_rh_hPa(TA_C, RHpct) / 10,
+    VPD_best_kPa     = coalesce(VPD_site_kPa, VPD_fallback_kPa),
+    Date = as.Date(DateTime - minutes(30)),
+    hr   = hour(DateTime),
+    is_day    = !is.na(Rg_bio) & Rg_bio >= 10,
+    is_midday = hr >= 11 & hr <= 15,
+    VPD_day_kPa    = if_else(is_day,    VPD_best_kPa, NA_real_),
+    VPD_midday_kPa = if_else(is_midday, VPD_best_kPa, NA_real_)
+  )
+
+vpd_daily_site <- site_vpd_hh %>%
+  group_by(site, Date) %>%
+  summarise(
+    VPD_mean_kPa   = safe_mean(VPD_best_kPa),
+    VPD_day_kPa    = safe_mean(VPD_day_kPa),
+    VPD_midday_kPa = safe_mean(VPD_midday_kPa),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = site,
+    values_from = c(VPD_mean_kPa, VPD_day_kPa, VPD_midday_kPa),
+    names_glue = "{site}_{.value}"
+  )
+
+daily_master <- daily_flux_wide %>%
+  left_join(vpd_daily_site, by = "Date") %>%
+  left_join(used_drivers_daily, by = "Date")
+
+write_csv(
+  daily_master,
+  file.path(out_dir, "compare", paste0("Daily_LD_MD_Fluxes_plus_Drivers_plus_VPD_", year_use, "_", scen_use, ".csv"))
+)
+
+# ============================================================
+# 14) MONTHLY BARS
+# ============================================================
+monthly_by_site <- daily_flux %>%
+  mutate(
+    site = factor(site, levels = c("LD", "MD")),
+    MonthStart = floor_date(Date, "month")
+  ) %>%
+  group_by(site, MonthStart) %>%
+  summarise(
+    n_obs_NEE  = sum(!is.na(NEE_gC_day)),
+    n_obs_GPP  = sum(!is.na(GPP_gC_day)),
+    n_obs_Reco = sum(!is.na(Reco_gC_day)),
+    NEE_mean   = safe_mean(NEE_gC_day),
+    GPP_mean   = safe_mean(GPP_gC_day),
+    Reco_mean  = safe_mean(Reco_gC_day),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    n_days = days_in_month(MonthStart),
+    cov_NEE  = n_obs_NEE  / n_days,
+    cov_GPP  = n_obs_GPP  / n_days,
+    cov_Reco = n_obs_Reco / n_days,
+    NEE  = if_else(cov_NEE  < min_coverage, NA_real_, NEE_mean  * n_days),
+    GPP  = if_else(cov_GPP  < min_coverage, NA_real_, GPP_mean  * n_days),
+    Reco = if_else(cov_Reco < min_coverage, NA_real_, Reco_mean * n_days)
+  ) %>%
+  select(site, MonthStart, NEE, GPP, Reco, cov_NEE, cov_GPP, cov_Reco)
+
+write_csv(
+  monthly_by_site,
+  file.path(out_dir, "compare", paste0("Monthly_flux_", year_use, "_", scen_use, ".csv"))
+)
+
+# ============================================================
+# 15) LD Gstorage + ENERGY BALANCE (2024-style method)
+# ============================================================
+z_plate_m <- 0.05
+rho_b     <- 1300
+cp_solid  <- 800
+rho_w     <- 1000
+cp_w      <- 4186
+max_abs_Gstor <- 200
+
+calc_Gstorage <- function(DateTime, TS_K, SWC, z_m,
+                          rho_b, cp_solid, rho_w, cp_w,
+                          expected_dt = 1800, max_gap_mult = 2) {
+
+  n <- length(DateTime)
+  if (n < 3) return(rep(NA_real_, n))
+
+  TS_K <- as.numeric(TS_K)
+  SWC  <- as.numeric(SWC)
+
+  med_ts <- suppressWarnings(median(TS_K, na.rm = TRUE))
+  if (!is.finite(med_ts)) return(rep(NA_real_, n))
+  if (med_ts < 150) TS_K <- TS_K + 273.15
+
+  Cv <- rho_b * cp_solid + SWC * rho_w * cp_w
+
+  dt_prev <- as.numeric(difftime(DateTime, dplyr::lag(DateTime), units = "secs"))
+  dt_next <- as.numeric(difftime(dplyr::lead(DateTime), DateTime, units = "secs"))
+
+  dT_prev <- TS_K - dplyr::lag(TS_K)
+  dT_next <- dplyr::lead(TS_K) - TS_K
+
+  dTdt <- rep(NA_real_, n)
+  ok_center <- !is.na(dT_prev) & !is.na(dT_next) & !is.na(dt_prev) & !is.na(dt_next)
+  dTdt[ok_center] <- 0.5 * (dT_prev[ok_center] / dt_prev[ok_center] +
+                            dT_next[ok_center] / dt_next[ok_center])
+
+  if (!is.na(dt_next[1]) && !is.na(dT_next[1])) dTdt[1] <- dT_next[1] / dt_next[1]
+  if (!is.na(dt_prev[n]) && !is.na(dT_prev[n])) dTdt[n] <- dT_prev[n] / dt_prev[n]
+
+  gap_limit <- expected_dt * max_gap_mult
+  bad_gap <- (dt_prev > gap_limit) | (dt_next > gap_limit)
+  dTdt[bad_gap] <- NA_real_
+
+  Cv * z_m * dTdt
+}
+
+need_cols(bio_drivers, c("DateTime","SHF","TS","SWC"), "bio_drivers (for EB)")
+
+eb_corr <- ld_full %>%
+  left_join(
+    bio_drivers %>%
+      transmute(
+        DateTime,
+        Rg  = as.numeric(RG_1_1_1),
+        Rn  = as.numeric(RN_1_1_1),
+        Gp  = as.numeric(SHF),
+        TS  = as.numeric(TS),
+        SWC = as.numeric(SWC)
+      ),
+    by = "DateTime"
+  ) %>%
+  transmute(
+    DateTime, Rg, Rn, Gp, TS, SWC,
+    H  = as.numeric(H),
+    LE = as.numeric(LE)
+  ) %>%
+  mutate(
+    across(c(Rg, Rn, Gp, TS, SWC, H, LE), ~ ifelse(.x %in% sentinel, NA_real_, .x))
+  ) %>%
+  arrange(DateTime) %>%
+  mutate(
+    Gstor = calc_Gstorage(
+      DateTime,
+      TS_K = TS,
+      SWC = SWC,
+      z_m = z_plate_m,
+      rho_b = rho_b,
+      cp_solid = cp_solid,
+      rho_w = rho_w,
+      cp_w = cp_w
+    ),
+    Gstor = ifelse(!is.na(Gstor) & abs(Gstor) > max_abs_Gstor, NA_real_, Gstor),
+    G0 = Gp + coalesce(Gstor, 0),
+    avail_corr = Rn - G0,
+    turb = H + LE
+  )
+
+write_csv(
+  eb_corr,
+  file.path(out_dir, "LD", paste0("LD_EB_table_with_Gstorage_", year_use, "_", run_tag, ".csv"))
+)
+
+eb_day <- eb_corr %>%
+  filter(!is.na(Rg) & Rg > 10) %>%
+  filter(is.finite(turb), is.finite(avail_corr))
+
+eb_midday_gs <- eb_corr %>%
+  filter(
+    !is.na(Rg) & Rg > 300,
+    hour(DateTime) >= 11, hour(DateTime) <= 15,
+    as.Date(DateTime) >= gs_start, as.Date(DateTime) <= gs_end
+  ) %>%
+  filter(is.finite(turb), is.finite(avail_corr))
+
+fit_if_possible <- function(df) if (nrow(df) < 50) NULL else lm(turb ~ avail_corr, data = df)
+
+fit_day <- fit_if_possible(eb_day)
+fit_mid <- fit_if_possible(eb_midday_gs)
+
+summ_fit <- function(fit, label, n) {
+  if (is.null(fit)) {
+    tibble(
+      window = label,
+      n = n,
+      slope = NA_real_,
+      intercept = NA_real_,
+      r2 = NA_real_
+    )
+  } else {
+    tibble(
+      window = label,
+      n = n,
+      slope = unname(coef(fit)[2]),
+      intercept = unname(coef(fit)[1]),
+      r2 = summary(fit)$r.squared
+    )
+  }
+}
+
+eb_summary <- bind_rows(
+  summ_fit(fit_day, "Daytime (Rg>10)", nrow(eb_day)),
+  summ_fit(fit_mid, "Midday GS (Rg>300, 11–15)", nrow(eb_midday_gs))
+)
+
+write_csv(
+  eb_summary,
+  file.path(out_dir, "LD", paste0("LD_energy_balance_storage_corrected_summary_", year_use, "_", run_tag, ".csv"))
+)
+
+plot_eb <- function(df, title, subtitle, out_png) {
+  p <- ggplot(df, aes(x = avail_corr, y = turb)) +
+    geom_point(alpha = 0.25) +
+    geom_abline(slope = 1, intercept = 0) +
+    geom_smooth(method = "lm", se = FALSE) +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = "Available energy (Rn - G0) [W m-2]",
+      y = "Turbulent flux (H + LE) [W m-2]"
+    ) +
+    theme_bw()
+
+  ggsave(out_png, p, width = 7, height = 5, dpi = 300)
+  p
+}
+
+plot_eb(
+  eb_day,
+  paste0("LD Energy Balance (Daytime, storage-corrected) — ", year_use, " (", run_tag, ")"),
+  "G0 = SHF plate + Gstorage (Cv*z*dT/dt)",
+  file.path(diagnostic_figure_dir, "LD", paste0("LD_EB_day_storage_corrected_", year_use, "_", run_tag, ".png"))
+)
+
+plot_eb(
+  eb_midday_gs,
+  paste0("LD Energy Balance (Midday GS, storage-corrected) — ", year_use, " (", run_tag, ")"),
+  "Rg>300, 11–15, growing season",
+  file.path(diagnostic_figure_dir, "LD", paste0("LD_EB_middayGS_storage_corrected_", year_use, "_", run_tag, ".png"))
+)
+
+# ============================================================
+# 16) YEARLY + GROWING-SEASON SUMMARIES
+# ============================================================
+
+# growing season flag on half-hour fluxes
+flux_hh <- flux_hh %>%
+  mutate(
+    Year = year(DateTime),
+    Date = as.Date(DateTime),
+    GrowingSeason = Date >= gs_start & Date <= gs_end
+  )
+
+# ----------------------------
+# 16a) yearly and GS totals from half-hour fluxes
+# ----------------------------
+flux_summary <- flux_hh %>%
+  group_by(site, Year) %>%
+  summarise(
+    n_hh_total = n(),
+    n_hh_NEE_nonmissing  = sum(!is.na(NEE_gC_hh)),
+    n_hh_GPP_nonmissing  = sum(!is.na(GPP_gC_hh)),
+    n_hh_Reco_nonmissing = sum(!is.na(Reco_gC_hh)),
+    NEE_gC_total  = safe_sum(NEE_gC_hh),
+    GPP_gC_total  = safe_sum(GPP_gC_hh),
+    Reco_gC_total = safe_sum(Reco_gC_hh),
+    NEE_gC_GS  = safe_sum(NEE_gC_hh[GrowingSeason]),
+    GPP_gC_GS  = safe_sum(GPP_gC_hh[GrowingSeason]),
+    Reco_gC_GS = safe_sum(Reco_gC_hh[GrowingSeason]),
+    .groups = "drop"
+  )
+
+write_csv(
+  flux_summary,
+  file.path(out_dir, "compare", paste0("Yearly_and_GS_flux_summary_", year_use, "_", scen_use, ".csv"))
+)
+
+# ----------------------------
+# 16b) RP availability summary
+# ----------------------------
+rp_summary <- bind_rows(
+  ld_rp %>% mutate(site = "LD"),
+  md_rp %>% mutate(site = "MD")
+) %>%
+  mutate(
+    Year = year(DateTime),
+    Date = as.Date(DateTime),
+    GrowingSeason = Date >= gs_start & Date <= gs_end
+  ) %>%
+  group_by(site, Year) %>%
+  summarise(
+    n_hh_total = n(),
+    n_hh_measured = sum(!is.na(NEE), na.rm = TRUE),
+    n_hh_modeled  = sum(is.na(NEE),  na.rm = TRUE),
+    pct_hh_modeled = 100 * n_hh_modeled / n_hh_total,
+    n_hh_GS_total    = sum(GrowingSeason, na.rm = TRUE),
+    n_hh_GS_measured = sum(GrowingSeason & !is.na(NEE), na.rm = TRUE),
+    n_hh_GS_modeled  = sum(GrowingSeason &  is.na(NEE), na.rm = TRUE),
+    pct_hh_GS_modeled = 100 * n_hh_GS_modeled / n_hh_GS_total,
+    .groups = "drop"
+  )
+
+write_csv(
+  rp_summary,
+  file.path(out_dir, "compare", paste0("RP_coverage_summary_", year_use, ".csv"))
+)
+
+# ----------------------------
+# 16c) random uncertainty from EddyPro rand_err_co2_flux
+# ----------------------------
+calc_rand_sd_total <- function(full_df, rp_df, site_name) {
+  full_df %>%
+    transmute(
+      DateTime,
+      rand_err_co2_flux = as.numeric(rand_err_co2_flux)
+    ) %>%
+    left_join(
+      rp_df %>%
+        transmute(DateTime, keep = !is.na(NEE)),
+      by = "DateTime"
+    ) %>%
+    mutate(
+      rand_err_gC_hh = umolco2_to_gC_hh(rand_err_co2_flux),
+      Date = as.Date(DateTime),
+      GrowingSeason = Date >= gs_start & Date <= gs_end
+    ) %>%
+    summarise(
+      site = site_name,
+      Year = year_use,
+      NEE_SD_rand_gC_total =
+        sqrt(sum((rand_err_gC_hh[keep & !is.na(rand_err_gC_hh)])^2, na.rm = TRUE)),
+      NEE_SD_rand_gC_GS =
+        sqrt(sum((rand_err_gC_hh[keep & GrowingSeason & !is.na(rand_err_gC_hh)])^2, na.rm = TRUE))
+    )
+}
+
+rand_sd_summary <- bind_rows(
+  calc_rand_sd_total(ld_full, ld_rp, "LD"),
+  calc_rand_sd_total(md_full, md_rp, "MD")
+)
+
+write_csv(
+  rand_sd_summary,
+  file.path(out_dir, "compare", paste0("Random_uncertainty_summary_", year_use, ".csv"))
+)
+
+# ----------------------------
+# 16d) u* threshold uncertainty using DAILY propagation
+# ----------------------------
+extract_scen_daily <- function(run_export, rp_tbl, site_name) {
+  exp_tbl <- as_tibble(run_export) %>%
+    mutate(
+      DateTime = rp_tbl$DateTime,
+      Date = as.Date(DateTime),
+      GrowingSeason = Date >= gs_start & Date <= gs_end
+    )
+
+  scen_labels <- c("U05", "U50", "U95")
+
+  map_dfr(scen_labels, function(sc) {
+    nee_col <- paste0("NEE_", sc, "_f")
+
+    if (!nee_col %in% names(exp_tbl)) {
+      stop("Missing expected REddyProc scenario column: ", nee_col)
+    }
+
+    exp_tbl %>%
+      transmute(
+        site = site_name,
+        Year = year_use,
+        Date,
+        GrowingSeason,
+        ustar_scenario = sc,
+        NEE_gC_hh = umolco2_to_gC_hh(as.numeric(.data[[nee_col]]))
+      ) %>%
+      group_by(site, Year, Date, GrowingSeason, ustar_scenario) %>%
+      summarise(
+        NEE_gC_day = sum(NEE_gC_hh, na.rm = TRUE),
+        .groups = "drop"
+      )
+  })
+}
+
+ustar_daily <- bind_rows(
+  extract_scen_daily(ld_run$export, ld_rp, "LD"),
+  extract_scen_daily(md_run$export, md_rp, "MD")
+)
+
+write_csv(
+  ustar_daily,
+  file.path(out_dir, "compare", paste0("Ustar_daily_", year_use, ".csv"))
+)
+
+ustar_totals <- ustar_daily %>%
+  group_by(site, Year, ustar_scenario) %>%
+  summarise(
+    NEE_gC_total = safe_sum(NEE_gC_day),
+    NEE_gC_GS    = safe_sum(NEE_gC_day[GrowingSeason]),
+    .groups = "drop"
+  )
+
+print(ustar_totals, n = Inf)
+
+write_csv(
+  ustar_totals,
+  file.path(out_dir, "compare", paste0("Ustar_scenario_totals_", year_use, ".csv"))
+)
+
+ustar_sd_summary <- ustar_daily %>%
+  pivot_wider(
+    names_from = ustar_scenario,
+    values_from = NEE_gC_day
+  ) %>%
+  mutate(
+    sd_day = apply(select(., U05, U50, U95), 1, sd, na.rm = TRUE)
+  ) %>%
+  group_by(site, Year) %>%
+  summarise(
+    NEE_SD_ustar_gC_total = sqrt(sum(sd_day^2, na.rm = TRUE)),
+    NEE_SD_ustar_gC_GS    = sqrt(sum((sd_day[GrowingSeason])^2, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+write_csv(
+  ustar_sd_summary,
+  file.path(out_dir, "compare", paste0("Ustar_uncertainty_summary_", year_use, ".csv"))
+)
+
+# ----------------------------
+# 16e) combined annual + GS summary
+# ----------------------------
+final_summary <- flux_summary %>%
+  left_join(rand_sd_summary, by = c("site", "Year")) %>%
+  left_join(ustar_sd_summary, by = c("site", "Year")) %>%
+  left_join(rp_summary, by = c("site", "Year")) %>%
+  mutate(
+    NEE_SD_total_gC_total = sqrt(NEE_SD_rand_gC_total^2 + NEE_SD_ustar_gC_total^2),
+    NEE_SD_total_gC_GS    = sqrt(NEE_SD_rand_gC_GS^2    + NEE_SD_ustar_gC_GS^2)
+  )
+
+write_csv(
+  final_summary,
+  file.path(out_dir, "compare", paste0("Final_annual_GS_summary_", year_use, "_", scen_use, ".csv"))
+)
+
+# ============================================================
+# 17) CUMULATIVE ORCHARD COMPARISON
+# ============================================================
+
+flux_hh <- flux_hh %>%
+  mutate(
+    Year = year(DateTime)
+  ) %>%
+  filter(Year == year_use) %>%   # 🔥 THIS LINE FIXES YOUR PROBLEM
+  mutate(
+    Date = as.Date(DateTime),
+    GrowingSeason = Date >= gs_start & Date <= gs_end,
+    DOY = yday(Date)
+  )
+
+# ----------------------------
+# 17a) daily sums for cumulative curves
+# ----------------------------
+cum_daily <- flux_hh %>%
+  group_by(site, Date, Year, DOY, GrowingSeason) %>%
+  summarise(
+    NEE_gC_day  = safe_sum(NEE_gC_hh),
+    GPP_gC_day  = safe_sum(GPP_gC_hh),
+    Reco_gC_day = safe_sum(Reco_gC_hh),
+    .groups = "drop"
+  ) %>%
+  arrange(site, Date)
+
+# ----------------------------
+# 17b) cumulative growing-season only
+# ----------------------------
+cum_gs <- cum_daily %>%
+  filter(GrowingSeason) %>%
+  group_by(site, Year) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    DaysSinceGSStart = as.integer(Date - gs_start),
+    cum_NEE_gC  = cumsum(replace_na(NEE_gC_day, 0)),
+    cum_GPP_gC  = cumsum(replace_na(GPP_gC_day, 0)),
+    cum_Reco_gC = cumsum(replace_na(Reco_gC_day, 0))
+  ) %>%
+  ungroup()
+
+write_csv(
+  cum_gs,
+  file.path(out_dir, "compare", paste0("Cumulative_GS_flux_", year_use, "_", scen_use, ".csv"))
+)
+
+# ----------------------------
+# 17c) cumulative full-year
+# ----------------------------
+cum_annual <- cum_daily %>%
+  group_by(site, Year) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    cum_NEE_gC  = cumsum(replace_na(NEE_gC_day, 0)),
+    cum_GPP_gC  = cumsum(replace_na(GPP_gC_day, 0)),
+    cum_Reco_gC = cumsum(replace_na(Reco_gC_day, 0))
+  ) %>%
+  ungroup()
+
+write_csv(
+  cum_annual,
+  file.path(out_dir, "compare", paste0("Cumulative_annual_flux_", year_use, "_", scen_use, ".csv"))
+)
+
+# ----------------------------
+# 17d) orchard-to-orchard difference (MD - LD)
+# ----------------------------
+cum_gs_wide <- cum_gs %>%
+  select(site, Date, Year, DaysSinceGSStart, cum_NEE_gC, cum_GPP_gC, cum_Reco_gC) %>%
+  pivot_wider(
+    names_from = site,
+    values_from = c(cum_NEE_gC, cum_GPP_gC, cum_Reco_gC),
+    names_glue = "{site}_{.value}"
+  ) %>%
+  mutate(
+    MD_minus_LD_cum_NEE_gC  = MD_cum_NEE_gC  - LD_cum_NEE_gC,
+    MD_minus_LD_cum_GPP_gC  = MD_cum_GPP_gC  - LD_cum_GPP_gC,
+    MD_minus_LD_cum_Reco_gC = MD_cum_Reco_gC - LD_cum_Reco_gC
+  )
+
+write_csv(
+  cum_gs_wide,
+  file.path(out_dir, "compare", paste0("Cumulative_GS_orchard_difference_", year_use, "_", scen_use, ".csv"))
+)
+
+# ----------------------------
+# 17e) plots
+# ----------------------------
+site_cols <- c(
+  LD = "#D55E00",
+  MD = "#0072B2"
+)
+
+p_cum_nee_gs <- ggplot(
+  cum_gs,
+  aes(x = DaysSinceGSStart, y = cum_NEE_gC, color = site)
+) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = site_cols) +
+  labs(
+    title = paste0("Cumulative Growing-Season NEE — ", year_use, " (", scen_use, ")"),
+    x = "Days since growing-season start",
+    y = expression("Cumulative NEE (g C " * m^-2 * ")"),
+    color = "Orchard"
+  ) +
+  theme_bw()
+
+ggsave(
+  file.path(diagnostic_figure_dir, "compare", paste0("Cumulative_GS_NEE_", year_use, "_", scen_use, ".png")),
+  p_cum_nee_gs, width = 8, height = 5, dpi = 300
+)
+
+p_cum_annual_nee <- ggplot(
+  cum_annual,
+  aes(x = DOY, y = cum_NEE_gC, color = site)
+) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = site_cols) +
+  labs(
+    title = paste0("Cumulative Annual NEE — ", year_use, " (", scen_use, ")"),
+    x = "Day of year",
+    y = expression("Cumulative NEE (g C " * m^-2 * ")"),
+    color = "Orchard"
+  ) +
+  theme_bw()
+
+ggsave(
+  file.path(diagnostic_figure_dir, "compare", paste0("Cumulative_annual_NEE_", year_use, "_", scen_use, ".png")),
+  p_cum_annual_nee, width = 8, height = 5, dpi = 300
+)
+
+p_cum_diff <- ggplot(
+  cum_gs_wide,
+  aes(x = DaysSinceGSStart, y = MD_minus_LD_cum_NEE_gC)
+) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  labs(
+    title = paste0("Cumulative GS NEE Difference (MD - LD) — ", year_use, " (", scen_use, ")"),
+    x = "Days since growing-season start",
+    y = expression("Difference in cumulative NEE (g C " * m^-2 * ")")
+  ) +
+  theme_bw()
+
+ggsave(
+  file.path(diagnostic_figure_dir, "compare", paste0("Cumulative_GS_NEE_difference_MD_minus_LD_", year_use, "_", scen_use, ".png")),
+  p_cum_diff, width = 8, height = 5, dpi = 300
+)
+
+# ============================================================
+# 18) SCREENING DIAGNOSTICS FOR 10% SPIKE DATA
+# ============================================================
+
+# Purpose:
+#   - evaluate whether current NEE screening thresholds are reasonable
+#   - use RAW NEE values (before filtering) for diagnostics
+#   - inspect patterns by site, season, day/night, u*, and radiation
+
+# ------------------------------------------------------------
+# 18a) BUILD DIAGNOSTIC TABLE
+# ------------------------------------------------------------
+diag_tbl <- bind_rows(
+  ld_rp %>% mutate(site = "LD"),
+  md_rp %>% mutate(site = "MD")
+) %>%
+  mutate(
+    site = factor(site, levels = c("LD", "MD")),
+    Date = as.Date(DateTime),
+    Month = month(DateTime),
+    Hour = hour(DateTime) + minute(DateTime) / 60,
+    GrowingSeason = Date >= gs_start & Date <= gs_end,
+    WinterWindow = Month %in% c(1, 2, 3, 11, 12),
+    DayNight = case_when(
+      !is.na(Rg) & Rg < 10  ~ "Night",
+      !is.na(Rg) & Rg >= 10 ~ "Day",
+      TRUE ~ NA_character_
+    ),
+    LightClass = case_when(
+      !is.na(Rg) & Rg < 10 ~ "Rg < 10",
+      !is.na(Rg) & Rg >= 10 & Rg < 50 ~ "10 ≤ Rg < 50",
+      !is.na(Rg) & Rg >= 50 & Rg < 300 ~ "50 ≤ Rg < 300",
+      !is.na(Rg) & Rg >= 300 ~ "Rg ≥ 300",
+      TRUE ~ NA_character_
+    ),
+    SeasonClass = case_when(
+      GrowingSeason ~ "Growing season",
+      WinterWindow  ~ "Winter window",
+      TRUE          ~ "Shoulder season"
+    ),
+    low_ustar_flag = !is.na(Ustar) & Ustar < ustar_review_thr
+  )
+
+write_csv(
+  diag_tbl,
+  file.path(out_dir, "compare", paste0("Screening_diagnostic_table_", year_use, "_10spike.csv"))
+)
+
+# ------------------------------------------------------------
+# 18b) OVERVIEW COUNTS
+# ------------------------------------------------------------
+diag_counts <- diag_tbl %>%
+  group_by(site, SeasonClass, DayNight) %>%
+  summarise(
+    n_total = n(),
+    n_nonmissing_NEEraw = sum(!is.na(NEE_raw)),
+    n_low_ustar = sum(low_ustar_flag, na.rm = TRUE),
+    pct_low_ustar = 100 * n_low_ustar / n_total,
+    .groups = "drop"
+  )
+
+write_csv(
+  diag_counts,
+  file.path(out_dir, "compare", paste0("Screening_diag_counts_", year_use, "_10spike.csv"))
+)
+
+print(diag_counts)
+
+# ------------------------------------------------------------
+# 18c) QUANTILE TABLE FOR NEE_raw
+# ------------------------------------------------------------
+diag_quantiles <- diag_tbl %>%
+  filter(!is.na(NEE_raw), !is.na(DayNight)) %>%
+  group_by(site, SeasonClass, DayNight) %>%
+  summarise(
+    n = n(),
+    min = min(NEE_raw, na.rm = TRUE),
+    p0.5 = quantile(NEE_raw, 0.005, na.rm = TRUE),
+    p1   = quantile(NEE_raw, 0.01,  na.rm = TRUE),
+    p5   = quantile(NEE_raw, 0.05,  na.rm = TRUE),
+    median = median(NEE_raw, na.rm = TRUE),
+    p95  = quantile(NEE_raw, 0.95,  na.rm = TRUE),
+    p99  = quantile(NEE_raw, 0.99,  na.rm = TRUE),
+    p99.5 = quantile(NEE_raw, 0.995, na.rm = TRUE),
+    max = max(NEE_raw, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(
+  diag_quantiles,
+  file.path(out_dir, "compare", paste0("Screening_diag_quantiles_", year_use, "_10spike.csv"))
+)
+
+print(diag_quantiles)
+
+# ------------------------------------------------------------
+# 18d) CANDIDATE THRESHOLD COUNTS
+# ------------------------------------------------------------
+candidate_threshold_counts <- diag_tbl %>%
+  filter(!is.na(NEE_raw)) %>%
+  summarise(
+    winter_night_lt_neg4 = sum(WinterWindow & DayNight == "Night" & low_ustar_flag & NEE_raw < -4, na.rm = TRUE),
+    winter_night_lt_neg5 = sum(WinterWindow & DayNight == "Night" & low_ustar_flag & NEE_raw < -5, na.rm = TRUE),
+    winter_night_lt_neg6 = sum(WinterWindow & DayNight == "Night" & low_ustar_flag & NEE_raw < -6, na.rm = TRUE),
+
+    winter_night_gt_10 = sum(WinterWindow & DayNight == "Night" & low_ustar_flag & NEE_raw > 10, na.rm = TRUE),
+    winter_night_gt_12 = sum(WinterWindow & DayNight == "Night" & low_ustar_flag & NEE_raw > 12, na.rm = TRUE),
+    winter_night_gt_15 = sum(WinterWindow & DayNight == "Night" & low_ustar_flag & NEE_raw > 15, na.rm = TRUE),
+
+    gs_day_lt_neg40 = sum(GrowingSeason & DayNight == "Day" & NEE_raw < -40, na.rm = TRUE),
+    gs_day_lt_neg45 = sum(GrowingSeason & DayNight == "Day" & NEE_raw < -45, na.rm = TRUE),
+    gs_day_lt_neg50 = sum(GrowingSeason & DayNight == "Day" & NEE_raw < -50, na.rm = TRUE),
+    gs_day_lt_neg55 = sum(GrowingSeason & DayNight == "Day" & NEE_raw < -55, na.rm = TRUE),
+    gs_day_lt_neg60 = sum(GrowingSeason & DayNight == "Day" & NEE_raw < -60, na.rm = TRUE),
+
+    nongs_any_lt_neg25 = sum(!GrowingSeason & NEE_raw < -25, na.rm = TRUE),
+    nongs_any_gt_80    = sum(!GrowingSeason & NEE_raw > 80,  na.rm = TRUE)
+  )
+
+write_csv(
+  candidate_threshold_counts,
+  file.path(out_dir, "compare", paste0("Screening_candidate_threshold_counts_", year_use, "_10spike.csv"))
+)
+
+print(candidate_threshold_counts)
+
+# ------------------------------------------------------------
+# 18e) THRESHOLD COUNTS BY SITE
+# ------------------------------------------------------------
+candidate_threshold_counts_by_site <- diag_tbl %>%
+  filter(!is.na(NEE_raw)) %>%
+  group_by(site) %>%
+  summarise(
+    winter_night_lt_neg5 = sum(WinterWindow & DayNight == "Night" & low_ustar_flag & NEE_raw < -5, na.rm = TRUE),
+    winter_night_gt_12   = sum(WinterWindow & DayNight == "Night" & low_ustar_flag & NEE_raw > 12, na.rm = TRUE),
+    gs_day_lt_neg40      = sum(GrowingSeason & DayNight == "Day" & NEE_raw < -40, na.rm = TRUE),
+    gs_day_lt_neg55      = sum(GrowingSeason & DayNight == "Day" & NEE_raw < -55, na.rm = TRUE),
+    nongs_any_lt_neg25   = sum(!GrowingSeason & NEE_raw < -25, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(
+  candidate_threshold_counts_by_site,
+  file.path(out_dir, "compare", paste0("Screening_candidate_threshold_counts_by_site_", year_use, "_10spike.csv"))
+)
+
+print(candidate_threshold_counts_by_site)
+
+# ------------------------------------------------------------
+# 18f) PLOT 1 — WINTER NIGHT NEE_raw vs Ustar
+# ------------------------------------------------------------
+p_winter_night_ustar <- diag_tbl %>%
+  filter(
+    WinterWindow,
+    DayNight == "Night",
+    !is.na(NEE_raw),
+    !is.na(Ustar)
+  ) %>%
+  ggplot(aes(x = Ustar, y = NEE_raw)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_hline(yintercept = -5, linetype = 2) +
+  geom_hline(yintercept = 12, linetype = 2) +
+  geom_vline(xintercept = ustar_review_thr, linetype = 2) +
+  facet_wrap(~site, ncol = 1) +
+  labs(
+    title = paste0("Winter night NEE_raw vs Ustar — ", year_use, " 10% spike"),
+    subtitle = "Dashed lines show current winter thresholds",
+    x = "Ustar",
+    y = expression("Raw NEE (" * mu * "mol CO"[2] * " m"^-2 * " s"^-1 * ")")
+  ) +
+  theme_bw()
+
+ggsave(
+  file.path(diagnostic_figure_dir, "compare", paste0("Diag_winter_night_NEEraw_vs_Ustar_", year_use, "_10spike.png")),
+  p_winter_night_ustar, width = 8, height = 7, dpi = 300
+)
+
+# ------------------------------------------------------------
+# 18g) PLOT 2 — GROWING-SEASON DAYTIME NEE_raw vs Rg
+# ------------------------------------------------------------
+p_gs_day_rg <- diag_tbl %>%
+  filter(
+    GrowingSeason,
+    DayNight == "Day",
+    !is.na(NEE_raw),
+    !is.na(Rg)
+  ) %>%
+  ggplot(aes(x = Rg, y = NEE_raw)) +
+  geom_point(alpha = 0.20, size = 1) +
+  geom_hline(yintercept = -40, linetype = 2) +
+  geom_hline(yintercept = -55, linetype = 2) +
+  facet_wrap(~site, ncol = 1) +
+  labs(
+    title = paste0("Growing-season daytime NEE_raw vs Rg — ", year_use, " 10% spike"),
+    subtitle = "Dashed lines show candidate daytime lower bounds",
+    x = expression("Rg (W m"^-2 * ")"),
+    y = expression("Raw NEE (" * mu * "mol CO"[2] * " m"^-2 * " s"^-1 * ")")
+  ) +
+  theme_bw()
+
+ggsave(
+  file.path(diagnostic_figure_dir, "compare", paste0("Diag_GS_day_NEEraw_vs_Rg_", year_use, "_10spike.png")),
+  p_gs_day_rg, width = 8, height = 7, dpi = 300
+)
+
+# ------------------------------------------------------------
+# 18h) PLOT 3 — WINTER NIGHT NEE_raw vs Tair
+# ------------------------------------------------------------
+p_winter_night_tair <- diag_tbl %>%
+  filter(
+    WinterWindow,
+    DayNight == "Night",
+    !is.na(NEE_raw),
+    !is.na(Tair)
+  ) %>%
+  ggplot(aes(x = Tair, y = NEE_raw)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_hline(yintercept = -5, linetype = 2) +
+  geom_hline(yintercept = 12, linetype = 2) +
+  facet_wrap(~site, ncol = 1) +
+  labs(
+    title = paste0("Winter night NEE_raw vs Tair — ", year_use, " 10% spike"),
+    subtitle = "Inspect whether extreme winter night fluxes look physiologically plausible",
+    x = expression("Air temperature (" * degree * "C)"),
+    y = expression("Raw NEE (" * mu * "mol CO"[2] * " m"^-2 * " s"^-1 * ")")
+  ) +
+  theme_bw()
+
+ggsave(
+  file.path(diagnostic_figure_dir, "compare", paste0("Diag_winter_night_NEEraw_vs_Tair_", year_use, "_10spike.png")),
+  p_winter_night_tair, width = 8, height = 7, dpi = 300
+)
+
+# ------------------------------------------------------------
+# 18i) PLOT 4 — DISTRIBUTIONS OF NEE_raw
+# ------------------------------------------------------------
+p_density <- diag_tbl %>%
+  filter(
+    !is.na(NEE_raw),
+    SeasonClass %in% c("Winter window", "Growing season"),
+    !is.na(DayNight)
+  ) %>%
+  mutate(Group = paste(SeasonClass, DayNight, sep = " | ")) %>%
+  ggplot(aes(x = NEE_raw, color = site)) +
+  geom_density(adjust = 1.2) +
+  facet_wrap(~Group, scales = "free_y", ncol = 2) +
+  scale_color_manual(values = c(LD = "#D55E00", MD = "#0072B2")) +
+  labs(
+    title = paste0("Distribution of raw NEE by season and day/night — ", year_use, " 10% spike"),
+    x = expression("Raw NEE (" * mu * "mol CO"[2] * " m"^-2 * " s"^-1 * ")"),
+    y = "Density",
+    color = "Site"
+  ) +
+  theme_bw()
+
+ggsave(
+  file.path(diagnostic_figure_dir, "compare", paste0("Diag_density_NEEraw_by_group_", year_use, "_10spike.png")),
+  p_density, width = 10, height = 8, dpi = 300
+)
+
+# ------------------------------------------------------------
+# 18j) PLOT 5 — BOXPLOTS OF NEE_raw
+# ------------------------------------------------------------
+p_box <- diag_tbl %>%
+  filter(
+    !is.na(NEE_raw),
+    SeasonClass %in% c("Winter window", "Growing season"),
+    !is.na(DayNight)
+  ) %>%
+  mutate(Group = paste(SeasonClass, DayNight, sep = " | ")) %>%
+  ggplot(aes(x = site, y = NEE_raw, fill = site)) +
+  geom_boxplot(outlier.alpha = 0.15) +
+  facet_wrap(~Group, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c(LD = "#D55E00", MD = "#0072B2")) +
+  labs(
+    title = paste0("Boxplots of raw NEE by season and day/night — ", year_use, " 10% spike"),
+    x = "Site",
+    y = expression("Raw NEE (" * mu * "mol CO"[2] * " m"^-2 * " s"^-1 * ")")
+  ) +
+  theme_bw()
+
+ggsave(
+  file.path(diagnostic_figure_dir, "compare", paste0("Diag_boxplot_NEEraw_by_group_", year_use, "_10spike.png")),
+  p_box, width = 10, height = 8, dpi = 300
+)
+
+# ------------------------------------------------------------
+# 18k) TABLE OF MOST EXTREME VALUES
+# ------------------------------------------------------------
+extreme_negative <- diag_tbl %>%
+  filter(!is.na(NEE_raw)) %>%
+  arrange(NEE_raw) %>%
+  select(site, DateTime, NEE_raw, Rg, Tair, Ustar, SeasonClass, DayNight, low_ustar_flag) %>%
+  slice_head(n = 100)
+
+extreme_positive <- diag_tbl %>%
+  filter(!is.na(NEE_raw)) %>%
+  arrange(desc(NEE_raw)) %>%
+  select(site, DateTime, NEE_raw, Rg, Tair, Ustar, SeasonClass, DayNight, low_ustar_flag) %>%
+  slice_head(n = 100)
+
+write_csv(
+  extreme_negative,
+  file.path(out_dir, "compare", paste0("Diag_extreme_negative_NEEraw_", year_use, "_10spike.csv"))
+)
+
+write_csv(
+  extreme_positive,
+  file.path(out_dir, "compare", paste0("Diag_extreme_positive_NEEraw_", year_use, "_10spike.csv"))
+)
+
+# ------------------------------------------------------------
+# 18l) OPTIONAL SUMMARY FOR CURRENT FILTER LOGIC
+# ------------------------------------------------------------
+filter_logic_summary <- diag_tbl %>%
+  group_by(site) %>%
+  summarise(
+    n_total = sum(!is.na(NEE_raw)),
+    n_flag_impossible = sum(flag_impossible, na.rm = TRUE),
+    n_flag_remove_winter_neg_night = sum(flag_remove_winter_neg_night, na.rm = TRUE),
+    n_flag_review_winter_pos_night = sum(flag_review_winter_pos_night, na.rm = TRUE),
+    n_flag_review_winter_transition = sum(flag_review_winter_transition, na.rm = TRUE),
+    n_flag_bad_qc = sum(flag_bad_qc, na.rm = TRUE),
+    n_flag_fetch_excluded = sum(flag_fetch_excluded, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(
+  filter_logic_summary,
+  file.path(out_dir, "compare", paste0("Screening_current_filter_logic_summary_", year_use, "_10spike.csv"))
+)
+
+print(filter_logic_summary)
+
+cat("\nFinished Section 18 screening diagnostics for 10% spike data.\n")
+
+# ------------------------------------------------------------
+# 18M) Analysis of extreme negative NEE to justify filters
+# ------------------------------------------------------------
+
+ext_neg <- read_csv(
+  file.path(
+    out_dir,
+    "compare",
+    paste0(
+      "Diag_extreme_negative_NEEraw_",
+      year_use,
+      "_10spike.csv"
+    )
+  ),
+  show_col_types = FALSE
+)
+
+ext_neg %>%
+  summarise(
+    n = n(),
+    min_val = min(NEE_raw, na.rm = TRUE),
+    p01 = quantile(NEE_raw, 0.01, na.rm = TRUE),
+    p05 = quantile(NEE_raw, 0.05, na.rm = TRUE),
+    median = median(NEE_raw, na.rm = TRUE)
+  )
+
+#Where do they occur?  
+ext_neg %>%
+  count(SeasonClass, DayNight)
+  
+#Check u*
+ggplot(ext_neg, aes(x = Ustar, y = NEE_raw)) +
+  geom_point(alpha = 0.3) +
+  theme_bw()
+  
+#How many are flagged low=u*
+ext_neg %>%
+  count(low_ustar_flag)
+  
+#Cross-tab by season and low-u*
+ext_neg %>%
+  count(SeasonClass, DayNight, low_ustar_flag)
+  
+#Check radiation (daytime plausiblity)
+ggplot(ext_neg, aes(x = Rg, y = NEE_raw, color = site)) +
+  geom_point(alpha = 0.4) +
+  scale_color_manual(values = site_cols) +
+  geom_hline(yintercept = c(-40, -55), linetype = 2) +
+  coord_cartesian(xlim = c(0, 400), ylim = c(-250, 0)) +
+  theme_bw()
+
+#By season/day-night
+ext_neg %>%
+  count(SeasonClass, DayNight, sort = TRUE)
+  
+
+  
+#Wind direction (advection smoking gun if there is clustering for winds out of the south)
+wind_lookup <- diag_tbl %>%
+  select(site, DateTime, wind_dir) %>%
+  distinct()
+
+ext_neg_wind <- ext_neg %>%
+  select(-any_of("wind_dir")) %>%
+  left_join(wind_lookup, by = c("site", "DateTime"))
+
+ggplot(ext_neg_wind, aes(x = wind_dir, y = NEE_raw, color = site)) +
+  geom_point(alpha = 0.3) +
+  theme_bw()
+  
+#Site breakdown
+ext_neg %>%
+  count(site, SeasonClass, DayNight)
+
+# ------------------------------------------------------------
+# 18N) Analysis of full data set and Rg to justify lower NEE boundary
+# ------------------------------------------------------------
+gs_day_tbl <- diag_tbl %>%
+  filter(
+    SeasonClass == "Growing season",
+    DayNight == "Day",
+    !is.na(NEE_raw),
+    !is.na(Rg)
+  )
+  
+ggplot(gs_day_tbl, aes(x = Rg, y = NEE_raw, color = site)) +
+  geom_point(alpha = 0.20, size = 1) +
+  geom_hline(yintercept = c(-40, -55), linetype = 2) +
+  scale_color_manual(values = site_cols) +
+  labs(
+    title = paste0("Growing-season daytime raw NEE vs Rg — ", year_use, " ", run_tag),
+    subtitle = "Dashed lines show candidate daytime lower bounds",
+    x = expression("Rg (W m"^-2 * ")"),
+    y = expression("Raw NEE (" * mu * "mol CO"[2] * " m"^-2 * " s"^-1 * ")")
+  ) +
+  theme_bw()
+  
+ggsave(
+  file.path(diagnostic_figure_dir, "compare", paste0("GS_day_NEEraw_vs_Rg_", year_use, "_", run_tag, ".png")),
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+gs_day_tbl %>%
+  summarise(
+    n_total = n(),
+    n_below_40 = sum(NEE_raw < -40, na.rm = TRUE),
+    n_below_55 = sum(NEE_raw < -55, na.rm = TRUE),
+    pct_below_40 = 100 * n_below_40 / n_total,
+    pct_below_55 = 100 * n_below_55 / n_total,
+    min_nee = min(NEE_raw, na.rm = TRUE),
+    p001 = quantile(NEE_raw, 0.001, na.rm = TRUE),
+    p005 = quantile(NEE_raw, 0.005, na.rm = TRUE),
+    p01  = quantile(NEE_raw, 0.01, na.rm = TRUE)
+  )
+  
+gs_day_tbl %>%
+  group_by(site) %>%
+  summarise(
+    n_total = n(),
+    n_below_40 = sum(NEE_raw < -40, na.rm = TRUE),
+    n_below_55 = sum(NEE_raw < -55, na.rm = TRUE),
+    pct_below_40 = 100 * n_below_40 / n_total,
+    pct_below_55 = 100 * n_below_55 / n_total,
+    min_nee = min(NEE_raw, na.rm = TRUE)
+  )
+ggplot(gs_day_tbl, aes(x = NEE_raw)) +
+  geom_density() +
+  geom_vline(xintercept = c(-40, -55), linetype = 2) +
+  facet_wrap(~site) +
+  theme_bw()
+
+
+
+# ------------------------------------------------------------
+# 18O) Analysis of full data set and Rg to justify upper NEE boundary
+# ------------------------------------------------------------
+diag_tbl %>%
+  group_by(site) %>%
+  summarise(
+    total_nee = sum(NEE_raw, na.rm = TRUE),
+    night_nee = sum(NEE_raw[is_night], na.rm = TRUE),
+    night_high = sum(NEE_raw[is_night & NEE_raw > 50], na.rm = TRUE),
+    night_lowustar = sum(NEE_raw[is_night & low_ustar], na.rm = TRUE)
+  )
+
+diag_tbl %>%
+  mutate(flag_high_night = is_night & NEE_raw > 50) %>%
+  group_by(site) %>%
+  summarise(
+    n_removed = sum(flag_high_night, na.rm = TRUE),
+    sum_removed = sum(NEE_raw[flag_high_night], na.rm = TRUE),
+    median_removed = median(NEE_raw[flag_high_night], na.rm = TRUE),
+    p95_removed = quantile(NEE_raw[flag_high_night], 0.95, na.rm = TRUE)
+  )
+
+diag_tbl %>%
+  mutate(flag_high_night = is_night & NEE_raw > 50) %>%
+  group_by(site) %>%
+  summarise(
+    pct_removed = 100 * mean(flag_high_night, na.rm = TRUE),
+    frac_sum_removed = sum(NEE_raw[flag_high_night], na.rm = TRUE) /
+                       sum(NEE_raw, na.rm = TRUE)
+  )
+
+
+# ============================================================
+# RESULTS TABLE FOR 2025
+# ============================================================
+
+results_table_2025 <- final_summary %>%
+  transmute(
+    Year,
+    Orchard = site,
+
+    `NEE_Full-year` = NEE_gC_total,
+    `Random NEE SD_Full-year` = NEE_SD_rand_gC_total,
+    `u* Threshold NEE SD_Full-year` = NEE_SD_ustar_gC_total,
+    `Total NEE SD_Full-year` = NEE_SD_total_gC_total,
+
+    `NEE_Growing-season` = NEE_gC_GS,
+    `Random NEE SD_Growing-season` = NEE_SD_rand_gC_GS,
+    `u* Threshold NEE SD_Growing-season` = NEE_SD_ustar_gC_GS,
+    `Total NEE SD_Growing-season` = NEE_SD_total_gC_GS
+  ) %>%
+  pivot_longer(
+    cols = -c(Year, Orchard),
+    names_to = c(".value", "Period"),
+    names_sep = "_(?=[^_]+$)"
+  ) %>%
+  left_join(
+    rp_summary %>%
+      transmute(
+        Year,
+        Orchard = site,
+        `Percent Gap-filled_Full-year` = pct_hh_modeled,
+        `Percent Gap-filled_Growing-season` = pct_hh_GS_modeled
+      ) %>%
+      pivot_longer(
+        cols = -c(Year, Orchard),
+        names_to = c(".value", "Period"),
+        names_sep = "_(?=[^_]+$)"
+      ) %>%
+      rename(`% Gap-filled` = `Percent Gap-filled`),
+    by = c("Year", "Orchard", "Period")
+  ) %>%
+  mutate(
+    Days = case_when(
+      Period == "Full-year" ~ if_else(leap_year(Year), 366L, 365L),
+      Period == "Growing-season" ~ as.integer(gs_end - gs_start) + 1L
+    )
+  ) %>%
+  select(
+    Year, Orchard, Period, Days, NEE,
+    `Random NEE SD`, `u* Threshold NEE SD`, `Total NEE SD`, `% Gap-filled`
+  ) %>%
+  arrange(Orchard, match(Period, c("Full-year", "Growing-season"))) %>%
+  mutate(
+    NEE = round(NEE, 0),
+    `Random NEE SD` = round(`Random NEE SD`, 0),
+    `u* Threshold NEE SD` = round(`u* Threshold NEE SD`, 0),
+    `Total NEE SD` = round(`Total NEE SD`, 0),
+    `% Gap-filled` = round(`% Gap-filled`, 0)
+  )
+
+print(results_table_2025, n = Inf)
+
+write_csv(
+  results_table_2025,
+  file.path(out_dir, "compare", paste0("Results_table_", year_use, "_", scen_use, ".csv"))
+)
+
+
+# ============================================================
+# SAVE U* THRESHOLD DISTRIBUTIONS
+# ============================================================
+
+uStar_LD <- ld_run$EProc$sGetEstimatedUstarThresholdDistribution() %>%
+  tibble::as_tibble()
+
+uStar_MD <- md_run$EProc$sGetEstimatedUstarThresholdDistribution() %>%
+  tibble::as_tibble()
+
+readr::write_csv(
+  uStar_LD,
+  file.path(out_dir, "LD", paste0("LD_uStar_thresholds_", year_use, ".csv"))
+)
+
+readr::write_csv(
+  uStar_MD,
+  file.path(out_dir, "MD", paste0("MD_uStar_thresholds_", year_use, ".csv"))
+)
+
+if ("aggregationMode" %in% names(uStar_LD)) {
+  uStar_LD_year <- uStar_LD %>%
+    filter(tolower(as.character(aggregationMode)) == "year")
+
+  readr::write_csv(
+    uStar_LD_year,
+    file.path(out_dir, "LD", paste0("LD_uStar_thresholds_YEARONLY_", year_use, ".csv"))
+  )
+}
+
+if ("aggregationMode" %in% names(uStar_MD)) {
+  uStar_MD_year <- uStar_MD %>%
+    filter(tolower(as.character(aggregationMode)) == "year")
+
+  readr::write_csv(
+    uStar_MD_year,
+    file.path(out_dir, "MD", paste0("MD_uStar_thresholds_YEARONLY_", year_use, ".csv"))
+  )
+}
+
+print(uStar_LD)
+print(uStar_MD)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(out_dir, paste0("sessionInfo_", year_use, ".txt"))
+)
+
+cat(
+  "\n2025 publication-processing workflow completed successfully.",
+  "\nProcessed outputs:", out_dir,
+  "\nDiagnostic figures:", diagnostic_figure_dir,
+  "\n"
+)
+
+```
