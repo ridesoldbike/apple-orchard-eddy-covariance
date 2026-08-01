@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this dataset and code, please cite the archived release."
+title: "Processed eddy covariance carbon flux data and analysis scripts for Michigan apple orchards (2023–2025)"
+version: 1.0.0
+type: dataset
+authors:
+  - family-names: Postma
+    given-names: Kevin
+    affiliation: Michigan State University
+    orcid: "https://orcid.org/0009-0000-7415-7148"
+abstract: >-
+  This repository contains processed eddy covariance carbon flux data,
+  quality-control and manual-review records, analysis scripts, figures,
+  and manuscript-supporting tables for a study of Michigan apple orchards
+  from 2023 through 2025.
+keywords:
+  - eddy covariance
+  - apple orchard
+  - carbon flux
+  - net ecosystem exchange
+  - gross primary productivity
+  - ecosystem respiration
+  - Michigan
+  - orchard systems
+license: CC-BY-4.0
